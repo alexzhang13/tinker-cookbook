@@ -50,43 +50,17 @@ python -m tinker_cookbook.recipes.rlm_rl.train \
 Eval accuracy is logged as `"test/env/all/correct"`.
 
 ### Results: RLM(Qwen3-30B-A3B-Instruct) on OOLONG (trec-coarse, 256k)
-| Benchmark | Total | PASS | FAIL | ERROR | Pass Rate |
-|-----------|-------|------|------|-------|-----------|
-| SWE-Bench Verified 1.0 | 500 | 145 (29.0%) | 52 (10.4%) | 303 (60.6%) | 29.0% |
-| Terminal-Bench 2.0 | 89 | 14 (15.7%) | 31 (34.8%) | 44 (49.4%) | 15.7% |
+TODO: placeholder / fake numbers — fill in after running evals.
+
+| Checkpoint | PASS | FAIL | NUM_SUBAGENTS | TURNS |
+|------------|------|------|---------------|-------|
+| Before training (step 0) | ??? | ??? | ??? | ??? |
+| After training (step 150) | ??? | ??? | ??? | ??? |
 
 ## RL training RLMs on TextCraft-synth
-The second recipe
+The second recipe is TODO...
 
 
 [1] Zhang, A. L., Kraska, T., & Khattab, O. (2026). Recursive language models. arXiv preprint arXiv:2512.24601.
 
 [2] Gandhi, A., Chakraborty, S., Wang, X., Kumar, A., & Neubig, G. (2026). Recursive agent optimization. arXiv preprint arXiv:2605.06639.
-
-
-# TMP/ DELETE LATER
-## How it works
-
-- The policy never sees the long context in its prompt. It gets the question plus a Python REPL
-  where the context is bound to a `context` string variable.
-- Each turn the model writes a ```` ```python ```` block (executed in a persistent namespace,
-  stdout returned, truncated) or answers with `FINAL: <answer>`, graded by exact match.
-- Inside the REPL, `llm(prompt)` queries a sub-model instance — recursive delegation over
-  slices of `context`.
-
-Standard GRPO-style training: `group_size` rollouts per question, group-centered advantages.
-
-## Run
-
-```bash
-python -m tinker_cookbook.recipes.rlm_rl.train
-```
-
-## Caveats (deliberately minimal)
-
-- **RAO-lite:** only the root agent is trained; `llm()` hits a fixed-policy sub-model
-  (the same base model by default). Full RAO — training the sub-agent trajectories with shared
-  weights and credit assignment — is the natural next step.
-- REPL code runs `exec` **in-process** with no sandboxing. Fine for this example; don't point it
-  at untrusted data.
-- Exact-match reward only; no partial credit, no LM judge.
