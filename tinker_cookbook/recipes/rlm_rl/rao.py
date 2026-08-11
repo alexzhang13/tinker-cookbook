@@ -1,9 +1,7 @@
 """Recursive Agent Optimization (RAO) glue between a Harness and the RL loop.
 
-Every turn — root or sub-agent — is sampled by the current policy and lands
-in the trajectory. sub_reward_lambda controls how much reward sub-agent
-transitions receive: at 0 they are loss-masked (sampled on-policy, zero
-gradient) and only the root chain trains. lambda > 0 is not implemented yet.
+`sub_reward_lambda` controls how much reward sub-agent transitions receive: at 0 they are
+loss-masked and only the root chain trains. lambda > 0 is not implemented yet.
 """
 
 from __future__ import annotations
@@ -35,8 +33,8 @@ class HarnessEnv(MessageEnv):
     async def step(self, message: Message) -> MessageStepResult:
         metrics: dict[str, float] = {}
         if self._expect_subagent:
-            # PARSE_ERROR_MASKED_METRIC_KEY is the loss-mask channel
-            # trajectory_to_data honors; here it marks a sub-agent turn.
+            # PARSE_ERROR_MASKED_METRIC_KEY is the loss-mask channel trajectory_to_data
+            # honors; here it marks a sub-agent turn.
             metrics = {SUBAGENT_METRIC_KEY: 1.0, PARSE_ERROR_MASKED_METRIC_KEY: 1.0}
         step = await self.harness.step(message)
         self._expect_subagent = step.subagent

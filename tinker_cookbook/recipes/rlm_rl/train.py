@@ -7,7 +7,7 @@ from datetime import datetime
 import chz
 
 from tinker_cookbook import cli_utils, model_info
-from tinker_cookbook.recipes.rlm_rl.oolong_env import OolongTrecDatasetBuilder
+from tinker_cookbook.recipes.rlm_rl.oolong_env import OolongDatasetBuilder
 from tinker_cookbook.rl.train import Config, main
 
 
@@ -30,6 +30,12 @@ class CLIConfig:
     max_iterations: int = 20
     max_tokens: int = 4096
     max_trajectory_tokens: int = 16384
+    max_sub_calls: int = 25
+    sub_max_tokens: int = 16384
+    sub_renderer_name: str | None = None
+    sub_temperature: float = 1.0
+    repl_mem_limit_gb: int = 2
+    repl_compute_timeout_s: float = 60.0
 
     eval_every: int = 0
     save_every: int = 20
@@ -55,7 +61,7 @@ async def cli_main(cli: CLIConfig):
         lora_rank=cli.lora_rank,
         learning_rate=cli.learning_rate,
         max_tokens=cli.max_tokens,
-        dataset_builder=OolongTrecDatasetBuilder(
+        dataset_builder=OolongDatasetBuilder(
             model_name_for_tokenizer=cli.model_name,
             renderer_name=renderer_name,
             batch_size=cli.groups_per_batch,
@@ -67,6 +73,12 @@ async def cli_main(cli: CLIConfig):
             n_batches=cli.max_steps,
             max_iterations=cli.max_iterations,
             max_trajectory_tokens=cli.max_trajectory_tokens,
+            max_sub_calls=cli.max_sub_calls,
+            sub_max_tokens=cli.sub_max_tokens,
+            sub_renderer_name=cli.sub_renderer_name,
+            sub_temperature=cli.sub_temperature,
+            repl_mem_limit_gb=cli.repl_mem_limit_gb,
+            repl_compute_timeout_s=cli.repl_compute_timeout_s,
             num_eval_examples=50 if cli.eval_every > 0 else 0,
             seed=cli.seed,
         ),

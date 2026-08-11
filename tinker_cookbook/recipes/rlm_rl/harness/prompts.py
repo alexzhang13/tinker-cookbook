@@ -11,9 +11,11 @@ _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 
 @functools.cache
-def rlm_system_prompt(custom_tools_section: str = "") -> str:
+def rlm_system_prompt(custom_tools_section: str = "", max_sub_calls: int = 25) -> str:
     template = jinja2.Template((_PROMPTS_DIR / "rlm_system_prompt.jinja").read_text())
-    return template.render(custom_tools_section=custom_tools_section).strip()
+    return template.render(
+        custom_tools_section=custom_tools_section, max_sub_calls=max_sub_calls
+    ).strip()
 
 
 def system_messages(
@@ -21,8 +23,9 @@ def system_messages(
     context_chars: int,
     context_type: str,
     root_prompt: str | None,
+    max_sub_calls: int = 25,
 ) -> list[Message]:
-    system = rlm_system_prompt()
+    system = rlm_system_prompt(max_sub_calls=max_sub_calls)
     metadata = (
         f"Your context is a {context_type} of {context_chars} total characters."
         " Each sub-LLM call can handle roughly ~100k tokens at once."

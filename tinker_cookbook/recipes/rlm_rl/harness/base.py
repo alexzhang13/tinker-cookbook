@@ -1,11 +1,8 @@
-"""Generic sub-agent calling harness class.
+"""Generic sub-agent calling harness.
 
-A Harness owns everything between model samples: conversation structure,
-tool execution, and delegation to sub-agents. Sub-agent turns surface as
-HarnessStep(messages=..., subagent=True), so the same policy samples root
-and sub-agent tokens alike — on-policy by construction.
-
-Drive a harness with a fixed completer (`run`) or with the trained policy (`rao.HarnessEnv`).
+A Harness owns everything between model samples: conversation structure, tool execution, and
+delegation to sub-agents. Drive one with a fixed completer (`run`) or the trained policy
+(`rao.HarnessEnv`).
 """
 
 from __future__ import annotations

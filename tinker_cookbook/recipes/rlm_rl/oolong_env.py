@@ -9,8 +9,10 @@ from datetime import datetime
 from typing import Any
 
 import chz
+import tinker
 
 from tinker_cookbook import model_info, tokenizer_utils
+from tinker_cookbook.completers import MessageCompleter, TinkerMessageCompleter
 from tinker_cookbook.recipes.rlm_rl.harness.rlm_agent import RLMAgent
 from tinker_cookbook.recipes.rlm_rl.rao import CyclingRLDataset, HarnessEnv
 from tinker_cookbook.renderers import get_renderer
@@ -96,7 +98,9 @@ def load_oolong(
     import datasets
 
     stream = datasets.load_dataset("oolongbench/oolong-synth", split=split, streaming=True)
-    stream = stream.shuffle(seed=seed, buffer_size=10_000)
+    # Shuffling precedes the filter below, so the buffer retains rows of every context length,
+    # including 256k ones at ~1MB apiece. Keep it small.
+    stream = stream.shuffle(seed=seed, buffer_size=1_000)
     keep = ("id", "question", "answer", "answer_type", "context_window_text")
     rows_P: list[dict[str, Any]] = []
     for ex in stream:
@@ -122,6 +126,10 @@ class OolongEnvGroupBuilder(EnvGroupBuilder):
         max_iterations: int,
         max_trajectory_tokens: int,
         sub_reward_lambda: float = 0.0,
+        max_sub_calls: int = 25,
+        sub_completer: MessageCompleter | None = None,
+        repl_mem_limit_bytes: int = 2 * 1024**3,
+        repl_compute_timeout_s: float = 60.0,
     ):
         self.row = row
         self.model_name = model_name
@@ -131,6 +139,10 @@ class OolongEnvGroupBuilder(EnvGroupBuilder):
         self.max_iterations = max_iterations
         self.max_trajectory_tokens = max_trajectory_tokens
         self.sub_reward_lambda = sub_reward_lambda
+        self.max_sub_calls = max_sub_calls
+        self.sub_completer = sub_completer
+        self.repl_mem_limit_bytes = repl_mem_limit_bytes
+        self.repl_compute_timeout_s = repl_compute_timeout_s
         self._harnesses_G: list[RLMAgent] = []
 
     async def make_envs(self) -> Sequence[Env]:
@@ -149,6 +161,10 @@ class OolongEnvGroupBuilder(EnvGroupBuilder):
                 root_prompt=f"{TREC_INSTRUCTION}\n\nQuestion: {row['question']}",
                 max_iterations=self.max_iterations,
                 depth=self.depth,
+                max_sub_calls=self.max_sub_calls,
+                sub_completer=self.sub_completer,
+                repl_mem_limit_bytes=self.repl_mem_limit_bytes,
+                repl_compute_timeout_s=self.repl_compute_timeout_s,
             )
             for _ in range(self.group_size)
         ]
@@ -189,9 +205,54 @@ class OolongDatasetBuilder(RLDatasetBuilder):
     n_batches: int = 150
     max_iterations: int = 20
     max_trajectory_tokens: int = 16384
+    max_sub_calls: int = 25
+    sub_max_tokens: int = 16384
+    # Sub-calls are tool-style extraction, not reasoning turns: on a thinking model the default
+    # renderer burns the whole token budget on a trace and is truncated before it answers.
+    sub_renderer_name: str | None = None
+    sub_temperature: float = 1.0
+    # Worst-case REPL memory is (groups_per_batch * group_size) * repl_mem_limit_gb: every
+    # episode holds one REPL process concurrently.
+    repl_mem_limit_gb: int = 2
+    repl_compute_timeout_s: float = 60.0
     seed: int = 42
 
-    def _group_builder(self, row: dict[str, Any], group_size: int) -> OolongEnvGroupBuilder:
+    def _sub_completer(self) -> MessageCompleter | None:
+        """A dedicated sampling client for sub-agent turns, enabling concurrent fan-out.
+
+        Only valid at ``sub_reward_lambda == 0``, where sub-agent turns are loss-masked and the
+        rollout queue would buy nothing but serial latency. Above 0 those turns must land in
+        the trajectory to receive credit, so the queue path is used instead.
+        """
+        if self.sub_reward_lambda != 0.0:
+            return None
+        tokenizer = tokenizer_utils.get_tokenizer(self.model_name_for_tokenizer)
+        service_client = tinker.ServiceClient()
+        return TinkerMessageCompleter(
+            sampling_client=service_client.create_sampling_client(
+                base_model=self.model_name_for_tokenizer
+            ),
+            renderer=get_renderer(self._sub_renderer_name(), tokenizer),
+            max_tokens=self.sub_max_tokens,
+            temperature=self.sub_temperature,
+        )
+
+    def _sub_renderer_name(self) -> str:
+        """Renderer for sub-agent calls, preferring a non-thinking variant when one exists."""
+        if self.sub_renderer_name is not None:
+            return self.sub_renderer_name
+        candidates = model_info.get_recommended_renderer_names(self.model_name_for_tokenizer)
+        for name in candidates:
+            if "disable_thinking" in name or "no_thinking" in name:
+                return name
+        return candidates[0] if candidates else "role_colon"
+
+    def _group_builder(
+        self,
+        row: dict[str, Any],
+        group_size: int,
+        sub_completer: MessageCompleter | None,
+    ) -> OolongEnvGroupBuilder:
         return OolongEnvGroupBuilder(
             row=row,
             model_name=self.model_name_for_tokenizer,
@@ -201,14 +262,19 @@ class OolongDatasetBuilder(RLDatasetBuilder):
             max_iterations=self.max_iterations,
             max_trajectory_tokens=self.max_trajectory_tokens,
             sub_reward_lambda=self.sub_reward_lambda,
+            max_sub_calls=self.max_sub_calls,
+            sub_completer=sub_completer,
+            repl_mem_limit_bytes=self.repl_mem_limit_gb * 1024**3,
+            repl_compute_timeout_s=self.repl_compute_timeout_s,
         )
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
+        sub_completer = self._sub_completer()
         train_rows_P = load_oolong(
             context_len=self.train_context_len, num_examples=self.num_train_examples, seed=self.seed
         )
         train = CyclingRLDataset(
-            [self._group_builder(row, self.group_size) for row in train_rows_P],
+            [self._group_builder(row, self.group_size, sub_completer) for row in train_rows_P],
             batch_size=self.batch_size,
             n_batches=self.n_batches,
             seed=self.seed,
@@ -219,7 +285,7 @@ class OolongDatasetBuilder(RLDatasetBuilder):
             context_len=self.eval_context_len, num_examples=self.num_eval_examples, seed=self.seed
         )
         test = CyclingRLDataset(
-            [self._group_builder(row, 1) for row in eval_rows_P],
+            [self._group_builder(row, 1, sub_completer) for row in eval_rows_P],
             batch_size=len(eval_rows_P),
             n_batches=1,
         )
