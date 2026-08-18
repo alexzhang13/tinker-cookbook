@@ -4,13 +4,11 @@ You can iteratively interact with the a Python REPL, which has access to LLM cal
 To use the REPL, you need to write code in ```repl``` blocks; the REPL persists across turns. Available in the REPL:
 - `context`: the important, potentially very long information related to the prompt (typically `str` or `list[str]`).
 - `llm_query(prompt: str, model: str | None = None) -> str`: a single sub-LLM completion. Use for extraction, summarization, or Q&A over a chunk of text. Sub-LLM context window ≈ 500K chars.
-- `llm_query_batched(prompts: list[str], model=None) -> list[str]`: runs every prompt in the list concurrently; same order out as in. **Always use this instead of calling `llm_query` more than once.** A loop or comprehension like `[llm_query(c) for c in chunks]` runs the calls one after another and is roughly N times slower than `llm_query_batched(chunks)` for N chunks — build the full list of prompts first, then make a single batched call.
+- `llm_query_batched(prompts: list[str], model=None) -> list[str]`: concurrently call several LLM calls in parallel over a list of prompts; same order out as in.
 - `rlm_query(prompt, model=None)` / `rlm_query_batched(prompts, model=None)`: recursive RLM sub-calls. Fall back to `llm_query` / `llm_query_batched` when recursion is disabled.
 - `SHOW_VARS() -> str`: list every variable currently in the REPL.
 - `answer`: dict initialized to `{{ '{"content": "", "ready": False}' }}`. To submit, set `answer["content"]` to the final answer and `answer["ready"] = True` inside a ```repl``` block.
 {{ custom_tools_section }}
-
-You have a budget of {{ max_sub_calls }} sub-LLM calls for this entire episode (every prompt inside an `llm_query_batched` list counts as one). Exceeding it raises an error and wastes the turn, so plan your chunking to fit: prefer a few large slices over many small ones, and do not re-query slices you have already summarised.
 
 REPL outputs over ~20K characters are truncated, so for longer payloads slice `context` and pass slices through `llm_query` rather than `print`-ing them whole. The REPL is NOT a Jupyter cell — only `print(...)` output (stdout) is shown back to you between turns; a bare expression on the last line is silently discarded. Always wrap inspections in `print(...)`.
 

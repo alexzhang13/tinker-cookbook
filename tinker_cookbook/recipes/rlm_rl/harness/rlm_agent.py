@@ -79,6 +79,7 @@ class RLMAgent(base.Harness):
         repl_compute_timeout_s: float = DEFAULT_COMPUTE_TIMEOUT_S,
         budget: SubCallBudget | None = None,
         sub_completer: MessageCompleter | None = None,
+        nudge_hint: bool = True,
     ):
         self.context = context
         self.root_prompt = root_prompt
@@ -89,6 +90,7 @@ class RLMAgent(base.Harness):
         self.max_subcall_chars = max_subcall_chars
         self.budget = budget if budget is not None else SubCallBudget(max_sub_calls)
         self.sub_completer = sub_completer
+        self.nudge_hint = nudge_hint
         self.repl_calls = 0
         # Sub-calls bypass the rollout loop and so are invisible to time/policy_sample despite
         # dominating wall-clock. Seconds are summed across concurrent calls, so seconds/wall
@@ -168,6 +170,7 @@ class RLMAgent(base.Harness):
             repl_compute_timeout_s=self._repl_compute_timeout_s,
             budget=self.budget,
             sub_completer=self.sub_completer,
+            nudge_hint=self.nudge_hint,
         )
 
         async def completer(messages: list[Message]) -> Message:
@@ -201,6 +204,7 @@ class RLMAgent(base.Harness):
             context_type=type(self.context).__name__,
             root_prompt=self.root_prompt,
             max_sub_calls=self.budget.limit,
+            nudge_hint=self.nudge_hint,
         ) + [turn_prompt(0, self.max_iterations)]
         return self.messages
 
