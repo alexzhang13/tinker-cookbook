@@ -12,7 +12,7 @@ _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 @functools.cache
 def nudge_hint_text(max_sub_calls: int = 25) -> str:
-    """The "nudge to decompose" addendum from: 
+    """The "nudge to decompose" addendum from:
     https://www.alphaxiv.org/abs/2607.language-model-harnesses
     """
     template = jinja2.Template((_PROMPTS_DIR / "nudge_hint.jinja").read_text())
@@ -45,7 +45,7 @@ def system_messages(
     system = rlm_system_prompt(max_sub_calls=max_sub_calls, nudge_hint=nudge_hint)
     metadata = (
         f"Your context is a {context_type} of {context_chars} total characters."
-        " Each sub-LLM call can handle roughly ~100k tokens at once."
+        " Each sub-LLM call can handle roughly ~100k characters at once."
     )
     if root_prompt:
         metadata = f"Answer the following: {root_prompt}\n\n{metadata}"
@@ -56,9 +56,14 @@ def system_messages(
 
 
 @functools.cache
-def judge_system_prompt() -> str:
+def judge_system_prompt(no_repl: bool = False) -> str:
+    """Rubric for grading one sub-agent.
+
+    `no_repl` selects the variant for a single-turn `llm_query` sub-agent: the default
+    rubric only marks an agent successful if it read the context with its REPL or
+    delegated, neither of which a single-turn agent can do."""
     template = jinja2.Template((_PROMPTS_DIR / "judge_system_prompt.jinja").read_text())
-    return template.render().strip()
+    return template.render(no_repl=no_repl).strip()
 
 
 def turn_prompt(iteration: int, max_iterations: int) -> Message:

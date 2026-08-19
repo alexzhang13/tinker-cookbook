@@ -1,5 +1,37 @@
-"""
-Defining an environment that implements Recursive Agent Optimization (RAO) over a harness.
+r"""Recursive Agent Optimization (RAO) over a harness of recursive sub-agents.
+
+A rollout is a *tree*: a root agent solves the task and may spawn sub-agents, which may
+spawn their own. RAO trains one shared policy on every node of that tree, so a single
+rollout yields one trajectory per node rather than one per rollout.
+
+Three equations from the paper ([RAO](https://arxiv.org/abs/2605.06639)) are implemented
+here, one per public function:
+
+    node reward   (Eq. 1)  R(X, \tau_X) = \tilde{s}(X, \tau_X)
+                                          + \lambda \frac{1}{|C(X)|}
+                                            \sum_{c \in C(X)} \tilde{s}(c, \tau_c)
+
+    advantage     (Eq. 3)  A(\tau^{(g)}) = R(\tau^{(g)}) - b_{-g},
+                           b_{-g} = \frac{1}{G-1} \sum_{g' \neq g} R^{(g')}_{root}
+
+    depth weight  (Eq. 4)  w_d = \alpha / N_d,
+                           \alpha = \sum_d N_d / D
+
+where `\tilde{s} \in [0, 1]` is the success signal for one node (task metric for the root,
+LLM judge for a sub-agent), `C(X)` are a node's immediate children, `G` is the group size,
+`N_d` is the number of trained depth-`d` trajectories in the group, and `D` is the number
+of distinct depths present. Note Eq. 3 subtracts a *root*-only leave-one-out baseline from
+every node at every depth: the paper's deliberate choice, putting all nodes under one root
+task on a common reference scale without needing a critic or per-sub-task comparison
+groups. Eq. 4 then keeps deep, numerous nodes from swamping the few root trajectories,
+while `\alpha` preserves the total update scale.
+
+Reading order, top to bottom:
+
+    RAOHarnessEnv           rolls out one tree and scores its nodes (Eq. 1)
+    expand_rao_trajectories  flattens a group's trees into trainable trajectories
+    rao_advantages           weights and centers those trajectories (Eqs. 3 and 4)
+    install_rao_training     wires both into the cookbook RL loop
 """
 
 from __future__ import annotations
@@ -8,6 +40,7 @@ import asyncio
 import random
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import tinker
@@ -21,31 +54,55 @@ from tinker_cookbook.renderers.base import Message
 from tinker_cookbook.rl.message_env import MessageEnv, MessageStepResult
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, Trajectory, TrajectoryGroup
 
-GradeFn = Callable[[str | None], Awaitable[float]]
-SubGradeFn = Callable[[RLMHarness], Awaitable[float]]
+# `\tilde{s}` for the root (from its final answer) and for a sub-agent (from its whole
+# trajectory, since a sub-task usually has no verifier).
+RootGrader = Callable[[str | None], Awaitable[float]]
+NodeGrader = Callable[[RLMHarness], Awaitable[float]]
 
-_INSTALLED = False
+# Tree structure travels from rollout to advantage computation as trajectory metrics.
+# IS_ROOT is also the marker for "this node was graded": a trajectory without it is not
+# part of any tree RAO trains on (see `RAOHarnessEnv.step`).
+IS_ROOT = "rao/is_root"
+DEPTH = "rao/depth"
+LOCAL_REWARD = "rao/local_reward"
+TREE_IDX = "rao/tree_idx"
 
 
-def _iter_harnesses(harness: RLMHarness) -> list[RLMHarness]:
-    out = [harness]
-    for child in harness.tools.child_agents:
-        out.extend(_iter_harnesses(child))
-    return out
+class RAOHarnessEnv(MessageEnv):
+    """One RAO rollout tree, presented to the RL loop as a single-agent environment.
 
+    The RL loop samples the root agent's turns; sub-agent turns are sampled underneath,
+    inside the harness, from the same policy (see `RLMTools`). When the harness finishes,
+    `step` scores every node in the tree with Eq. 1 and hands the sub-agents' trajectories
+    to `expand_rao_trajectories` via `extra_trajectories`.
 
-class HarnessEnv(MessageEnv):
+    Discarded trees: `step` only runs while the rollout runner is still stepping this env.
+    If the runner ends the rollout itself -- the sampler hit `max_tokens`, the response
+    failed to parse, or the conversation outgrew the context window -- it never calls
+    `step`, so the tree is never graded and *the whole tree is thrown out*: sub-agent turns
+    already sampled are dropped, and the root trajectory carries no `IS_ROOT`, which keeps
+    it out of the Eq. 3 baseline and gives it zero advantage. This costs the sub-agent
+    samples from those rollouts, and is the intended behaviour: a tree whose root never
+    submitted an answer has no `\\tilde{s}(root)` to build Eq. 1 from.
+
+    At `sub_reward_lambda == 0` this is plain root-only training: no node is graded but the
+    root, no extra trajectories are produced, and Eq. 3 reduces to a standard leave-one-out
+    baseline over the group.
+    """
+
     def __init__(
         self,
         harness: Harness,
-        grade: GradeFn,
+        grade: RootGrader,
         sub_reward_lambda: float = 0.0,
-        sub_grade: SubGradeFn | None = None,
+        sub_grade: NodeGrader | None = None,
     ):
         self.harness = harness
         self.grade = grade
         self.sub_reward_lambda = sub_reward_lambda
         self.sub_grade = sub_grade
+        # Read by `expand_rao_trajectories` after the rollout; empty unless this tree was
+        # graded and had sub-agents.
         self.extra_trajectories: list[Trajectory] = []
 
     async def initial_observation(self) -> list[Message]:
@@ -58,19 +115,21 @@ class HarnessEnv(MessageEnv):
         turn = await self.harness.act(message)
         if isinstance(turn, Prompt):
             return MessageStepResult(reward=0.0, episode_done=False, next_messages=turn.messages)
-        score = await self.grade(turn.final_answer)
-        reward = score
+
+        # The root agent finished: grade it, then the rest of its tree.
+        root_success = await self.grade(turn.final_answer)
+        reward = root_success
         metrics: dict[str, float] = {
-            "correct": score,
+            "correct": root_success,
             "answered": float(turn.final_answer is not None),
             **turn.metrics,
         }
-        if self.sub_reward_lambda != 0.0 and isinstance(self.harness, RLMHarness):
-            reward, extras = await self._rao_finish(score)
-            self.extra_trajectories = extras
-            metrics["rao/is_root"] = 1.0
-            metrics["rao/depth"] = float(self.harness.depth)
-            metrics["rao/local_reward"] = reward
+
+        # If lambda is non-zero, begin adding local rewards to sub-agents' trajectories.
+        if self._grades_sub_agents():
+            reward, self.extra_trajectories = await self._score_tree(root_success)
+            metrics |= {IS_ROOT: 1.0, DEPTH: float(self.harness.depth), LOCAL_REWARD: reward}
+
         return MessageStepResult(
             reward=reward,
             episode_done=True,
@@ -79,122 +138,148 @@ class HarnessEnv(MessageEnv):
             logs={"final_answer": turn.final_answer or "<no answer submitted>"},
         )
 
-    async def _rao_finish(self, root_score: float) -> tuple[float, list[Trajectory]]:
+    def _grades_sub_agents(self) -> bool:
+        return self.sub_reward_lambda != 0.0 and isinstance(self.harness, RLMHarness)
+
+    async def _score_tree(self, root_success: float) -> tuple[float, list[Trajectory]]:
+        r"""Apply Eq. 1 to every node; return the root's reward and the sub-agents' trajectories.
+
+            R(X) = \tilde{s}(X) + \lambda * mean_{c in C(X)} \tilde{s}(c)
+
+        The bonus uses the children's *mean* success, not their count, so spawning more
+        children is not itself rewarded. A node's reward lands on the last transition of
+        its own trajectory, which is where `rao_advantages` reads it.
+        """
         assert isinstance(self.harness, RLMHarness)
-        nodes = _iter_harnesses(self.harness)
-        scores: list[float] = [root_score]
+        nodes = _walk_tree(self.harness)
+        successes = [root_success, *await self._grade_sub_agents(nodes[1:])]
+        success_of = dict(zip(nodes, successes, strict=True))
 
-        async def _child_score(harness: RLMHarness) -> float:
-            if self.sub_grade is None:
-                return 0.0
-            return await self.sub_grade(harness)
-
-        if len(nodes) > 1:
-            scores.extend(await asyncio.gather(*(_child_score(n) for n in nodes[1:])))
-        score_of = dict(zip(nodes, scores, strict=True))
-        extras: list[Trajectory] = []
-        root_reward = root_score
-        for harness in nodes:
-            children = harness.tools.child_agents
-            bonus = sum(score_of[c] for c in children) / len(children) if children else 0.0
-            local = score_of[harness] + self.sub_reward_lambda * bonus
-            if harness is self.harness:
-                root_reward = local
+        root_reward = root_success
+        sub_agent_trajectories: list[Trajectory] = []
+        for node in nodes:
+            children = node.children
+            bonus = sum(success_of[c] for c in children) / len(children) if children else 0.0
+            reward = success_of[node] + self.sub_reward_lambda * bonus
+            if node is self.harness:
+                root_reward = reward
                 continue
-            if not harness.transitions:
+            if not node.transitions:
+                # Nothing was sampled for this node (e.g. its own sub-call raised), so
+                # there is no trajectory to train even though it still fed its parent's bonus.
                 continue
-            last = harness.transitions[-1]
-            last.reward = local
+            last = node.transitions[-1]
+            last.reward = reward
             last.episode_done = True
             last.metrics = {
                 **last.metrics,
-                "rao/is_root": 0.0,
-                "rao/depth": float(harness.depth),
-                "rao/local_reward": local,
+                IS_ROOT: 0.0,
+                DEPTH: float(node.depth),
+                LOCAL_REWARD: reward,
             }
-            extras.append(
-                Trajectory(
-                    transitions=list(harness.transitions),
-                    final_ob=tinker.ModelInput.empty(),
-                )
+            sub_agent_trajectories.append(
+                Trajectory(transitions=list(node.transitions), final_ob=tinker.ModelInput.empty())
             )
-        return root_reward, extras
+        return root_reward, sub_agent_trajectories
+
+    async def _grade_sub_agents(self, nodes: Sequence[RLMHarness]) -> list[float]:
+        if not nodes:
+            return []
+        grade = self.sub_grade
+        if grade is None:
+            return [0.0] * len(nodes)
+        return list(await asyncio.gather(*(grade(node) for node in nodes)))
 
 
 def expand_rao_trajectories(
     trajectory_group: list[Trajectory], env_group: Sequence[Env]
 ) -> list[tuple[float, dict[str, float]]]:
-    extras: list[Trajectory] = []
-    for i, (traj, env) in enumerate(zip(trajectory_group, env_group, strict=True)):
-        harness_env = getattr(env, "message_env", None)
-        if getattr(harness_env, "sub_reward_lambda", 0.0) == 0.0:
+    """Add each tree's sub-agent trajectories to the group, tagged with their tree.
+
+    Call from `EnvGroupBuilder.compute_group_rewards`, which is the one hook that sees a
+    whole group at once. `trajectory_group` is extended in place: it arrives holding one
+    root trajectory per rollout and leaves holding every trained node in the group. The
+    returned rewards are all zero because node rewards already live on the transitions.
+
+    Trees the runner discarded contribute nothing here (see `RAOHarnessEnv`); their root
+    trajectory is still tagged with `TREE_IDX` so `rao_advantages` can tell it apart from a
+    trajectory that was never part of a tree at all.
+    """
+    sub_agent_trajectories: list[Trajectory] = []
+    for tree_idx, (traj, env) in enumerate(zip(trajectory_group, env_group, strict=True)):
+        rao_env = _rao_env(env)
+        if rao_env is None or rao_env.sub_reward_lambda == 0.0:
             continue
-        if traj.transitions:
-            traj.transitions[-1].metrics["rao/tree_idx"] = float(i)
-        for child_traj in getattr(harness_env, "extra_trajectories", None) or []:
-            if child_traj.transitions:
-                child_traj.transitions[-1].metrics["rao/tree_idx"] = float(i)
-            extras.append(child_traj)
-    trajectory_group.extend(extras)
+        for node_traj in [traj, *rao_env.extra_trajectories]:
+            if node_traj.transitions:
+                node_traj.transitions[-1].metrics[TREE_IDX] = float(tree_idx)
+        sub_agent_trajectories.extend(rao_env.extra_trajectories)
+    trajectory_group.extend(sub_agent_trajectories)
     return [(0.0, {}) for _ in trajectory_group]
 
 
-def _is_rao_group(group: TrajectoryGroup) -> bool:
-    if not group.trajectories_G:
-        return False
-    traj = group.trajectories_G[0]
-    return bool(traj.transitions) and "rao/tree_idx" in traj.transitions[-1].metrics
-
-
 def rao_advantages(group: TrajectoryGroup) -> torch.Tensor:
-    trajs = group.trajectories_G
+    r"""Advantage per trajectory: a root-only leave-one-out baseline, weighted by depth.
+
+        Eq. 3:  A(\tau^{(g)}) = R(\tau^{(g)}) - b_{-g},
+                b_{-g} = 1/(G-1) * \sum_{g' \neq g} R^{(g')}_{root}
+        Eq. 4:  w_d = \alpha / N_d,  \alpha = |B| / D
+
+    Every node is centered on the mean reward of the *other* rollouts' roots, then scaled
+    by its depth's inverse frequency. Discarded trees (`IS_ROOT` absent) get advantage 0
+    and are excluded from both the baseline and the depth counts, so they neither train nor
+    shift anyone else's baseline.
+    """
     rewards = group.get_total_rewards()
-    tree_ids: list[int] = []
-    depths: list[int] = []
-    is_root: list[bool] = []
-    for traj in trajs:
-        metrics = traj.transitions[-1].metrics if traj.transitions else {}
-        tree_ids.append(int(metrics.get("rao/tree_idx", 0)))
-        depths.append(int(metrics.get("rao/depth", 0)))
-        is_root.append(float(metrics.get("rao/is_root", 0.0)) >= 0.5)
+    nodes = [_NodeInfo.from_trajectory(traj) for traj in group.trajectories_G]
 
-    root_reward_by_tree: dict[int, float] = {}
-    for reward, tree_id, root in zip(rewards, tree_ids, is_root, strict=True):
-        if root:
-            root_reward_by_tree[tree_id] = reward
-
-    trees = list(root_reward_by_tree)
-    n_trees = len(trees)
+    # Eq. 3: leave-one-out over root rewards. With one root left there is nothing to leave
+    # out, so the baseline is that root's own reward and the group contributes no gradient.
+    root_reward_by_tree = {
+        node.tree_idx: reward for node, reward in zip(nodes, rewards, strict=True) if node.is_root
+    }
     total = sum(root_reward_by_tree.values())
-    baselines: dict[int, float] = {}
-    for tree_id in trees:
-        if n_trees > 1:
-            baselines[tree_id] = (total - root_reward_by_tree[tree_id]) / (n_trees - 1)
-        else:
-            baselines[tree_id] = root_reward_by_tree[tree_id]
+    n_trees = len(root_reward_by_tree)
+    baselines = {
+        tree: (total - reward) / (n_trees - 1) if n_trees > 1 else reward
+        for tree, reward in root_reward_by_tree.items()
+    }
 
-    advantages = [
-        reward - baselines.get(tree_id, 0.0) for reward, tree_id in zip(rewards, tree_ids)
-    ]
-    n_traj = len(trajs)
-    counts = Counter(depths)
-    d_used = len(counts) or 1
-    alpha = n_traj / d_used
-    weights = [alpha / counts[depth] for depth in depths]
-    return torch.tensor([a * w for a, w in zip(advantages, weights)], dtype=torch.float32)
+    # Eq. 4: inverse frequency over the depths actually being trained.
+    trained_depths = [node.depth for node in nodes if node.trained]
+    per_depth = Counter(trained_depths)
+    alpha = len(trained_depths) / len(per_depth) if per_depth else 0.0
+
+    def advantage(node: _NodeInfo, reward: float) -> float:
+        if not node.trained or node.tree_idx not in baselines:
+            return 0.0  # discarded tree: no gradient from it
+        return (reward - baselines[node.tree_idx]) * (alpha / per_depth[node.depth])
+
+    return torch.tensor(
+        [advantage(node, reward) for node, reward in zip(nodes, rewards, strict=True)],
+        dtype=torch.float32,
+    )
 
 
 def install_rao_training() -> None:
-    """Hook the cookbook loop for RAO: expose the on-policy completer to child rollouts, and use root-LOO + depth-weighted advantages instead of GRPO."""
+    """Hook the cookbook RL loop for RAO. Idempotent, and a no-op for non-RAO groups.
+
+    Two hooks: expose the training policy to the harness so sub-agent turns are sampled
+    on-policy (rather than from a frozen sampling client), and swap GRPO's group centering
+    for `rao_advantages` on groups that carry a tree.
+    """
     global _INSTALLED
     if _INSTALLED:
         return
     _INSTALLED = True
+
     from tinker_cookbook.rl import train as rl_train
 
-    orig_call = TinkerTokenCompleter.__call__
+    # The harness reaches the policy through a ContextVar: it runs deep inside `Env.step`,
+    # far from where the loop constructs the completer.
+    original_call = TinkerTokenCompleter.__call__
 
-    async def patched_call(
+    async def call_and_publish_policy(
         self: TinkerTokenCompleter,
         model_input: tinker.ModelInput,
         stop: Any,
@@ -202,19 +287,19 @@ def install_rao_training() -> None:
         max_tokens: int | None = None,
     ) -> Any:
         current_token_completer.set(self)
-        return await orig_call(self, model_input, stop, max_tokens=max_tokens)
+        return await original_call(self, model_input, stop, max_tokens=max_tokens)
 
-    TinkerTokenCompleter.__call__ = patched_call
+    TinkerTokenCompleter.__call__ = call_and_publish_policy
 
-    orig_adv = rl_train.compute_advantages
+    grpo_advantages = rl_train.compute_advantages
 
-    def patched_adv(trajectory_groups_P: list[TrajectoryGroup]) -> list[torch.Tensor]:
+    def advantages_per_group(trajectory_groups_P: list[TrajectoryGroup]) -> list[torch.Tensor]:
         return [
-            rao_advantages(group) if _is_rao_group(group) else orig_adv([group])[0]
+            rao_advantages(group) if _is_rao_group(group) else grpo_advantages([group])[0]
             for group in trajectory_groups_P
         ]
 
-    rl_train.compute_advantages = patched_adv
+    rl_train.compute_advantages = advantages_per_group
 
 
 class RepeatingRLDataset(RLDataset):
@@ -244,3 +329,53 @@ class RepeatingRLDataset(RLDataset):
 
     def __len__(self) -> int:
         return self.n_batches
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_INSTALLED = False
+
+
+@dataclass(frozen=True)
+class _NodeInfo:
+    """Where one trajectory sits in its rollout tree, read back from its metrics."""
+
+    trained: bool
+    """Graded by `_score_tree`. False means the tree was discarded before grading."""
+    is_root: bool
+    depth: int
+    tree_idx: int
+
+    @classmethod
+    def from_trajectory(cls, traj: Trajectory) -> _NodeInfo:
+        metrics = traj.transitions[-1].metrics if traj.transitions else {}
+        return cls(
+            trained=IS_ROOT in metrics,
+            is_root=float(metrics.get(IS_ROOT, 0.0)) >= 0.5,
+            depth=int(metrics.get(DEPTH, 0)),
+            tree_idx=int(metrics.get(TREE_IDX, -1)),
+        )
+
+
+def _walk_tree(root: RLMHarness) -> list[RLMHarness]:
+    """The tree flattened depth-first, root first."""
+    nodes = [root]
+    for child in root.children:
+        nodes.extend(_walk_tree(child))
+    return nodes
+
+
+def _rao_env(env: Env) -> RAOHarnessEnv | None:
+    """Unwrap the `RAOHarnessEnv` inside a token-level env, if there is one."""
+    inner = getattr(env, "message_env", env)
+    return inner if isinstance(inner, RAOHarnessEnv) else None
+
+
+def _is_rao_group(group: TrajectoryGroup) -> bool:
+    """Whether this group carries rollout trees, and so wants `rao_advantages`."""
+    return any(
+        traj.transitions and TREE_IDX in traj.transitions[-1].metrics
+        for traj in group.trajectories_G
+    )

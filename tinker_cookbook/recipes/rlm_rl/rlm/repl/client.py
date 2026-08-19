@@ -209,3 +209,10 @@ class PythonRepl:
     @property
     def final_answer(self) -> str | None:
         return self._final_answer
+
+    def set_final_answer(self, answer: str) -> None:
+        """Record an answer that did not come from a ``repl`` block.
+
+        Used for a single-turn sub-agent (an ``llm_query``), whose whole completion *is*
+        its answer: it never runs code, so nothing would set ``answer["ready"]``."""
+        self._final_answer = answer

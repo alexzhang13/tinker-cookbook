@@ -54,6 +54,30 @@ Train the same RLM frontend on 1-episode (~55k) OOLONG-REAL validation examples 
 held-out 2-episode (~118k) test examples. Sub-agents are trained on-policy with RAO
 ($\lambda=0.4$, depth 2).
 
+Every sub-call is a node in the RAO tree: `rlm_query` / `launch_subagent` spawn a sub-agent with
+its own REPL, and an `llm_query` is treated as a sub-agent that has hit the depth limit — a
+single-turn agent with no REPL. All of them are sampled from the training policy, graded, and
+credited to their parent through the delegation bonus. At $\lambda=0$ sub-calls instead go to a
+separate frozen sampling client and only the root is trained.
+
+Because sub-agent success has no verifier, $\lambda>0$ scores each sub-agent with an LLM judge.
+The default judge is `thinkingmachines/Inkling-Small`, served by Tinker, so grading needs no
+second provider or API key. It is sampled at an explicit thinking effort (`JUDGE_EFFORT`, default
+0.7) because Inkling is post-trained with an effort message; at 0.2 it applies the rubric
+noticeably less consistently. The paper's judge is one flag away, and needs `OPENAI_API_KEY` set
+(the run fails at startup if it is not):
+
+```bash
+    judge_model=gpt-5-mini
+```
+
+The judge sees one of two rubrics. A sub-agent with a REPL gets the paper's rubric, which only
+passes an agent that read the context or delegated. A single-turn `llm_query` sub-agent can do
+neither, so it gets a variant that grades its answer alone — under the REPL rubric an
+Inkling-Small judge failed correct single-turn answers 4 times in 6, explicitly citing the missing
+process. Either way it is one judge call per node, so judge calls per step scale with
+`max_sub_calls`.
+
 ```bash
 python -m tinker_cookbook.recipes.rlm_rl.train \
     dataset=real \

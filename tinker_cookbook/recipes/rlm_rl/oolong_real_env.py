@@ -4,19 +4,24 @@ OOLONG-Real environment for Recursive Agent Optimization.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import json
+import logging
+import os
 import random
 import re
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import chz
 import tinker
 
 from tinker_cookbook import model_info, tokenizer_utils
 from tinker_cookbook.completers import MessageCompleter, TinkerMessageCompleter
+from tinker_cookbook.exceptions import ConfigurationError
 from tinker_cookbook.recipes.rlm_rl.rao import (
-    HarnessEnv,
+    RAOHarnessEnv,
     RepeatingRLDataset,
     expand_rao_trajectories,
 )
@@ -24,12 +29,36 @@ from tinker_cookbook.recipes.rlm_rl.rlm.prompts import judge_system_prompt
 from tinker_cookbook.recipes.rlm_rl.rlm.tools import current_renderer
 from tinker_cookbook.recipes.rlm_rl.rlm_harness import RLMHarness
 from tinker_cookbook.renderers import get_renderer, get_text_content
+from tinker_cookbook.renderers.base import Message
 from tinker_cookbook.rl.message_env import EnvFromMessageEnv
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder, Trajectory
 
-REAL_REPO = "oolongbench/oolong-real"
-REAL_CONFIG = "dnd"
-JUDGE_MODEL = "gpt-5-mini"
+if TYPE_CHECKING:
+    from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+
+OOLONG_REPO = "oolongbench/oolong-real"
+OOLONG_CONFIG = "dnd"
+# Namespaced names ("thinkingmachines/...") are Tinker models, bare names ("gpt-5-mini")
+# are OpenAI models. The default judge runs on Tinker, so grading needs no second provider
+# or API key; the paper's judge is one flag away (judge_model=gpt-5-mini).
+TINKER_JUDGE_MODEL = "thinkingmachines/Inkling-Small"
+OPENAI_JUDGE_MODEL = "gpt-5-mini"
+JUDGE_MODEL = TINKER_JUDGE_MODEL
+JUDGE_MAX_TOKENS = 2048
+# Inkling is post-trained with an explicit thinking-effort message. Grading needs a little
+# reasoning to check an answer against a transcript, but the verdict itself is one flag.
+JUDGE_EFFORT = 0.7
+OOLONG_INSTRUCTION = (
+    "The transcript is the REPL variable `context`, not this message. "
+    "For long context, chunk it (~32K characters) and call "
+    "`launch_subagent(goal, chunk)` / `rlm_query(prompt, context=chunk)`; "
+    "do not put the chunk in the goal, and do not use `llm_query` to read the transcript. "
+    'Put only the answer value in `answer["content"]`: an integer, a short string, or a '
+    "comma-separated list. Do not write a sentence (submit `10`, not "
+    "'The count of Nat20s is 10.'). `\\boxed{...}` is also accepted."
+)
 
 
 def dnd_parse_answer(answer: str) -> int | str | list[str]:
@@ -74,7 +103,15 @@ def _parse_judge_response(response: str) -> dict[str, Any]:
     else:
         code_match = re.search(r"```\s*(.*?)\s*```", response, re.DOTALL)
         json_str = code_match.group(1).strip() if code_match else response.strip()
-    parsed = json.loads(json_str)
+    try:
+        parsed = json.loads(json_str)
+    except json.JSONDecodeError:
+        # Last resort: an unfenced verdict wrapped in prose. Measured at roughly 5% of
+        # verdicts from a Tinker judge, and each failure silently zeroes a node's reward.
+        braces = re.search(r"\{.*\}", json_str, re.DOTALL)
+        if braces is None:
+            raise
+        parsed = json.loads(braces.group(0))
     if not isinstance(parsed, dict):
         raise ValueError("Response must be a JSON object")
     for field in ("reason", "success"):
@@ -88,6 +125,10 @@ def parse_judge_score(response: str) -> float:
     success_flag = rubric["success"]
     if isinstance(success_flag, bool):
         return 1.0 if success_flag else 0.0
+    # A quoted boolean is common enough that treating it as a failure would silently
+    # zero every sub-agent reward for a whole run.
+    if isinstance(success_flag, str) and success_flag.strip().lower() in ("true", "false"):
+        return 1.0 if success_flag.strip().lower() == "true" else 0.0
     return 0.0
 
 
@@ -100,9 +141,81 @@ def _action_history(harness: RLMHarness) -> str:
     return "\n".join(parts)
 
 
-async def judge_subagent(harness: RLMHarness, *, model: str = JUDGE_MODEL) -> float:
-    from openai import AsyncOpenAI
+def _is_tinker_judge(model: str) -> bool:
+    return "/" in model
 
+
+class TinkerJudge:
+    """Judge served by Tinker, using the credentials training already needs.
+
+    Sampled from the frozen base model, never the policy being trained, so no sub-agent is
+    graded by its own updated weights. Not a `TinkerMessageCompleter`: that renders without
+    an explicit thinking effort, and an Inkling judge is post-trained with an effort message
+    the renderer inserts, so leaving it implicit puts the judge off-distribution.
+    """
+
+    def __init__(
+        self, model: str, effort: float = JUDGE_EFFORT, max_tokens: int = JUDGE_MAX_TOKENS
+    ):
+        renderer_names = model_info.get_recommended_renderer_names(model)
+        renderer_name = next(
+            (name for name in renderer_names if "disable_thinking" in name), renderer_names[0]
+        )
+        self.renderer = get_renderer(renderer_name, tokenizer_utils.get_tokenizer(model))
+        self.sampling_client = tinker.ServiceClient().create_sampling_client(base_model=model)
+        self.effort = effort
+        self.max_tokens = max_tokens
+        self._takes_effort = (
+            "effort" in inspect.signature(self.renderer.build_generation_prompt).parameters
+        )
+
+    async def __call__(self, messages: list[Message]) -> str:
+        effort_kwarg = {"effort": self.effort} if self._takes_effort else {}
+        prompt = self.renderer.build_generation_prompt(messages, **effort_kwarg)
+        response = await self.sampling_client.sample_async(
+            prompt,
+            num_samples=1,
+            sampling_params=tinker.SamplingParams(
+                temperature=1.0,
+                max_tokens=self.max_tokens,
+                stop=self.renderer.get_stop_sequences(),
+            ),
+        )
+        message, termination = self.renderer.parse_response(response.sequences[0].tokens)
+        if not termination.is_clean:
+            raise ValueError("judge response did not parse; it was probably cut at max_tokens")
+        return get_text_content(message)
+
+
+@functools.cache
+def tinker_judge(model: str) -> TinkerJudge:
+    return TinkerJudge(model)
+
+
+@functools.cache
+def judge_client() -> AsyncOpenAI:
+    """The shared judge client, or a clear error if the optional dependency/key is missing.
+
+    Cached: sub-agent grading fans out one call per node, and a fresh ``AsyncOpenAI``
+    per call would leak a connection pool each time.
+    """
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise ConfigurationError(
+            "Grading sub-agents (sub_reward_lambda > 0) needs the openai package: "
+            "uv pip install 'tinker-cookbook[rlm-rl]'"
+        ) from exc
+    if not os.environ.get("OPENAI_API_KEY"):
+        raise ConfigurationError(
+            "An OpenAI judge model was selected for sub-agent grading, so OPENAI_API_KEY "
+            f"must be set. The default judge ({TINKER_JUDGE_MODEL}) runs on Tinker and "
+            "needs no extra key; sub_reward_lambda=0.0 trains the root agent only."
+        )
+    return AsyncOpenAI()
+
+
+async def judge_subagent(harness: RLMHarness, *, model: str = JUDGE_MODEL) -> float:
     goal = harness.root_prompt or ""
     if harness.context:
         prompt_start = f"# Task:\n{goal}\n\n# Context:\n{harness.context}"
@@ -114,18 +227,27 @@ async def judge_subagent(harness: RLMHarness, *, model: str = JUDGE_MODEL) -> fl
         f"\n\n## Agent Output\n{final_message if final_message is not None else 'No output provided'}"
         "\n\n## Error Message\nNo error message."
     )
+    messages: list[Message] = [
+        {"role": "system", "content": judge_system_prompt(no_repl=harness.no_repl)},
+        {"role": "user", "content": user_prompt},
+    ]
     try:
-        completion = await AsyncOpenAI().chat.completions.create(
+        if _is_tinker_judge(model):
+            return parse_judge_score(await tinker_judge(model)(messages))
+        completion = await judge_client().chat.completions.create(
             model=model,
-            messages=[
-                {"role": "system", "content": judge_system_prompt()},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,  # type: ignore[arg-type]
             temperature=1,
         )
-        text = completion.choices[0].message.content or ""
-        return parse_judge_score(text)
+        return parse_judge_score(completion.choices[0].message.content or "")
+    except ConfigurationError:
+        # A missing dependency or key is a misconfigured run, not a bad sub-agent.
+        raise
     except Exception:
+        # An unreachable judge or an unparsable rubric scores 0, but must be visible:
+        # silently returning 0 for every node looks exactly like a policy that never
+        # delegates well.
+        logger.warning("sub-agent judge failed; scoring this node 0.0", exc_info=True)
         return 0.0
 
 
@@ -139,7 +261,7 @@ def load_real(
 ) -> list[dict[str, Any]]:
     from datasets import load_dataset
 
-    dataset = load_dataset(REAL_REPO, REAL_CONFIG, split=split)
+    dataset = load_dataset(OOLONG_REPO, OOLONG_CONFIG, split=split)
     rows: list[dict[str, Any]] = []
     for ex in dataset:
         episodes = ex.get("episodes") or []
@@ -214,7 +336,7 @@ class RealEnvGroupBuilder(EnvGroupBuilder):
         self._harnesses_G = [
             RLMHarness(
                 context=row["context_window_text"],
-                root_prompt=row["question"],
+                root_prompt=f"{OOLONG_INSTRUCTION}\n\nQuestion: {row['question']}",
                 max_iterations=self.max_iterations,
                 max_depth=self.depth,
                 child_max_iterations=self.child_max_iterations,
@@ -223,13 +345,14 @@ class RealEnvGroupBuilder(EnvGroupBuilder):
                 mem_limit_bytes=self.repl_mem_limit_bytes,
                 compute_timeout_s=self.repl_compute_timeout_s,
                 nudge_hint=self.nudge_hint,
+                on_policy_llm_query=self.sub_reward_lambda != 0.0,
             )
             for _ in range(self.group_size)
         ]
         return [
             EnvFromMessageEnv(
                 renderer=renderer,
-                message_env=HarnessEnv(
+                message_env=RAOHarnessEnv(
                     h,
                     grade,
                     sub_reward_lambda=self.sub_reward_lambda,
@@ -343,6 +466,10 @@ class OolongRealDatasetBuilder(RLDatasetBuilder):
         )
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
+        if self.sub_reward_lambda != 0.0 and not _is_tinker_judge(self.judge_model):
+            # Fail at startup rather than on the first graded sub-agent, several
+            # minutes into step 0. A Tinker judge needs no key beyond TINKER_API_KEY.
+            judge_client()
         sub_completer = self._sub_completer()
         train_rows = load_real(
             split="validation",

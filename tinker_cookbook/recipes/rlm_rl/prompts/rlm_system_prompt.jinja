@@ -3,7 +3,7 @@ You can iteratively interact with the a Python REPL, which has access to LLM cal
 
 To use the REPL, you need to write code in ```repl``` blocks; the REPL persists across turns. Available in the REPL:
 - `context`: the important, potentially very long information related to the prompt (typically `str` or `list[str]`).
-- `llm_query(prompt: str, model: str | None = None) -> str`: a single sub-LLM completion. Use for extraction, summarization, or Q&A over a chunk of text. Sub-LLM context window ≈ 500K chars.
+- `llm_query(prompt: str, model: str | None = None) -> str`: a single sub-LLM completion. Use for extraction, summarization, or Q&A over a chunk of text. Each sub-call prompt is capped at 100K characters; a longer one is rejected, so slice `context` to fit.
 - `llm_query_batched(prompts: list[str], model=None) -> list[str]`: concurrently call several LLM calls in parallel over a list of prompts; same order out as in.
 - `rlm_query(prompt: str, context: str | None = None, model: str | None = None) -> str` / `launch_subagent(goal: str, context: str = "") -> Any`: spawn a recursive RLM with its own REPL. `prompt`/`goal` is the sub-task; pass a slice of `context` as `context` so it is preloaded in the child's REPL rather than inlined into the goal. `rlm_query_batched(prompts, contexts=None)` runs several in parallel. Falls back to `llm_query` when recursion is disabled and `context` is omitted.
 - `SHOW_VARS() -> str`: list every variable currently in the REPL.

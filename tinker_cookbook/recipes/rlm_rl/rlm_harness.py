@@ -19,10 +19,12 @@ class RLMHarness(REPLHarness):
         max_depth: int = 1,
         child_max_iterations: int = 8,
         max_sub_calls: int = 25,
-        max_subcall_chars: int = 60_000,
+        # Matches the per-prompt capacity the system prompt advertises to the model.
+        max_subcall_chars: int = 100_000,
         budget: SubCallBudget | None = None,
         sub_completer: MessageCompleter | None = None,
         nudge_hint: bool = True,
+        on_policy_llm_query: bool = False,
         mem_limit_bytes: int | None = None,
         compute_timeout_s: float | None = None,
     ):
@@ -31,6 +33,11 @@ class RLMHarness(REPLHarness):
         self.max_depth = max_depth
         self.child_max_iterations = child_max_iterations
         self.nudge_hint = nudge_hint
+        self.on_policy_llm_query = on_policy_llm_query
+        # True for a sub-agent that never gets to run code: a single-turn `llm_query`
+        # standing in for an agent at the depth limit. It is graded on its answer alone,
+        # since the process a REPL agent is judged on is not available to it.
+        self.no_repl = False
         self.transitions: list[Transition] = []
         self._max_sub_calls = max_sub_calls
         self._max_subcall_chars = max_subcall_chars
@@ -43,6 +50,7 @@ class RLMHarness(REPLHarness):
             max_depth=self.max_depth,
             make_child=self._make_child,
             max_prompt_chars=self._max_subcall_chars,
+            on_policy_llm_query=self.on_policy_llm_query,
         )
         repl_kwargs: dict[str, int | float] = {}
         if mem_limit_bytes is not None:
@@ -59,6 +67,11 @@ class RLMHarness(REPLHarness):
     @property
     def tools(self) -> RLMTools:
         return self.repl_tools
+
+    @property
+    def children(self) -> list[RLMHarness]:
+        """Sub-agents this agent spawned, in the order they completed."""
+        return self.repl_tools.child_agents
 
     def _make_child(self, prompt: str, context: str | None = None) -> RLMHarness:
         if context is None:
@@ -77,6 +90,7 @@ class RLMHarness(REPLHarness):
             budget=self.tools.budget,
             sub_completer=self._sub_completer,
             nudge_hint=self.nudge_hint,
+            on_policy_llm_query=self.on_policy_llm_query,
             mem_limit_bytes=self.mem_limit_bytes,
             compute_timeout_s=self.compute_timeout_s,
         )

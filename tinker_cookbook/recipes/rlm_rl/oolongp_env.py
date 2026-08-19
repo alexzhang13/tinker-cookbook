@@ -17,7 +17,7 @@ import tinker
 from tinker_cookbook import model_info, tokenizer_utils
 from tinker_cookbook.completers import MessageCompleter, TinkerMessageCompleter
 from tinker_cookbook.recipes.rlm_rl.rao import (
-    HarnessEnv,
+    RAOHarnessEnv,
     RepeatingRLDataset,
     expand_rao_trajectories,
 )
@@ -183,7 +183,7 @@ class PairsEnvGroupBuilder(EnvGroupBuilder):
         return [
             EnvFromMessageEnv(
                 renderer=renderer,
-                message_env=HarnessEnv(h, grade, sub_reward_lambda=self.sub_reward_lambda),
+                message_env=RAOHarnessEnv(h, grade, sub_reward_lambda=self.sub_reward_lambda),
                 failed_parse_reward=0.0,
                 context_overflow_reward=0.0,
                 max_trajectory_tokens=self.max_trajectory_tokens,

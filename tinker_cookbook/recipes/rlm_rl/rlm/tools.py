@@ -48,7 +48,8 @@ class RLMTools:
         depth: int,
         max_depth: int,
         make_child: MakeChild,
-        max_prompt_chars: int = 60_000,
+        max_prompt_chars: int = 100_000,
+        on_policy_llm_query: bool = False,
     ):
         self._sub_completer = sub_completer
         self.budget = budget
@@ -56,6 +57,7 @@ class RLMTools:
         self.max_depth = max_depth
         self._make_child = make_child
         self._max_prompt_chars = max_prompt_chars
+        self.on_policy_llm_query = on_policy_llm_query
         self.traces: list[SubCallTrace] = []
         self.child_agents: list[Any] = []
         self._inflight = 0
@@ -80,6 +82,8 @@ class RLMTools:
         self.peak_inflight = max(self.peak_inflight, self._inflight)
         started = time.monotonic()
         try:
+            if self._use_on_policy_llm_query():
+                return await self._on_policy_llm_query(prompt)
             return await self.sample([{"role": "user", "content": prompt}])
         finally:
             self._inflight -= 1
@@ -131,6 +135,40 @@ class RLMTools:
 
     async def launch_subagent(self, goal: str, context: str = "") -> Any:
         return await self.rlm_query(prompt=goal, context=context)
+
+    def _use_on_policy_llm_query(self) -> bool:
+        return (
+            self.on_policy_llm_query
+            and self.depth < self.max_depth
+            and current_token_completer.get() is not None
+            and current_renderer.get() is not None
+        )
+
+    async def _on_policy_llm_query(self, prompt: str) -> str:
+        """Run an `llm_query` as a sub-agent that has hit the depth limit.
+
+        A single-turn agent with no REPL: it is sampled from the training policy, keeps its
+        own transition so RAO can train it, and joins `child_agents` so it is graded and
+        credited to its parent like any recursive child."""
+        policy = current_token_completer.get()
+        renderer = current_renderer.get()
+        if policy is None or renderer is None:
+            return await self.sample([{"role": "user", "content": prompt}])
+        child = self._make_child(prompt, "")
+        messages: list[Message] = [{"role": "user", "content": prompt}]
+        ob = renderer.build_generation_prompt(messages)
+        ac = await policy(ob, renderer.get_stop_sequences())
+        parsed, _termination = renderer.parse_response(ac.tokens)
+        text = str(parsed.get("content", ""))
+        child.messages = [*messages, {"role": "assistant", "content": text}]
+        child.transitions.append(Transition(ob=ob, ac=ac, reward=0.0, episode_done=False))
+        child.repl.set_final_answer(text)
+        child.no_repl = True
+        # It never executes code, so release its REPL now; `run()` is what normally closes it.
+        child.close()
+        self.child_agents.append(child)
+        self.traces.append(SubCallTrace(messages=messages, completion=text, kind="llm_query"))
+        return text
 
     def _child_completer(
         self, child: Any

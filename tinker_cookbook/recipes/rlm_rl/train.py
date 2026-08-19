@@ -10,7 +10,7 @@ import chz
 from tinker.types import LossFnType
 
 from tinker_cookbook import cli_utils
-from tinker_cookbook.recipes.rlm_rl.oolong_real_env import OolongRealDatasetBuilder
+from tinker_cookbook.recipes.rlm_rl.oolong_real_env import JUDGE_MODEL, OolongRealDatasetBuilder
 from tinker_cookbook.recipes.rlm_rl.oolongp_env import OolongPairsDatasetBuilder
 from tinker_cookbook.recipes.rlm_rl.rao import install_rao_training
 from tinker_cookbook.rl.train import AsyncConfig, Config, main
@@ -51,13 +51,15 @@ class CLIConfig:
     eval_context_len: int = 32768
     num_train_examples: int = 20
     seed: int = 42
-    judge_model: str = "gpt-5-mini"
+    judge_model: str = JUDGE_MODEL
 
     # RLM-specific parameters
     sub_renderer_name: str | None = None
     disable_thinking: bool = True
     depth: int = 1
-    sub_reward_lambda: float = 0.0
+    # None means "this dataset's default" (0.0 for pairs, 0.4 for real). Explicit so that
+    # sub_reward_lambda=0.0 stays 0.0 on the real dataset instead of being read as unset.
+    sub_reward_lambda: float | None = None
     max_iterations: int = 15
     child_max_iterations: int = 8
     max_trajectory_tokens: int = 32768
@@ -88,7 +90,9 @@ async def cli_main(cli_config: CLIConfig):
         group_size = _real_or_cli(cli_config.group_size, 4, 8)
         groups_per_batch = _real_or_cli(cli_config.groups_per_batch, 8, 16)
         depth = _real_or_cli(cli_config.depth, 1, 2)
-        sub_reward_lambda = _real_or_cli(cli_config.sub_reward_lambda, 0.0, 0.4)
+        sub_reward_lambda = (
+            0.4 if cli_config.sub_reward_lambda is None else (cli_config.sub_reward_lambda)
+        )
         eval_every = _real_or_cli(cli_config.eval_every, 10, 50)
         max_sub_calls = _real_or_cli(cli_config.max_sub_calls, 200, 50)
         eval_max_iterations = _real_or_cli(cli_config.eval_max_iterations, 25, 15)
@@ -150,7 +154,7 @@ async def cli_main(cli_config: CLIConfig):
             batch_size=cli_config.groups_per_batch,
             group_size=cli_config.group_size,
             depth=cli_config.depth,
-            sub_reward_lambda=cli_config.sub_reward_lambda,
+            sub_reward_lambda=cli_config.sub_reward_lambda or 0.0,
             train_context_len=cli_config.train_context_len,
             eval_context_len=cli_config.eval_context_len,
             num_train_examples=cli_config.num_train_examples,

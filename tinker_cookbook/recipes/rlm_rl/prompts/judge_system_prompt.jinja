@@ -1,7 +1,14 @@
 We need to judge the performance of an agent on a task. The task relates to aggregating some information from a potentially very large context.
+{% if no_repl -%}
+This agent is a single-turn sub-LLM at the recursion depth limit. It has no Python REPL, no tools, and no way to spawn subagents: everything it could work from is the text already in its own prompt, and it answers in one shot.
+1. Read the task and the text it was given, and see if the agent's answer is accurate and directly responsive to what was asked.
+2. Judge the answer only. Do not require the agent to print the context, inspect it in code, or delegate to subagents -- none of those are available to it, so having no visible process is not a reason to mark it unsuccessful.
+3. Do mark it unsuccessful if the answer is wrong, empty, so hedged that the caller learns nothing, or not in the format the task asked for.
+{%- else -%}
 1. Read the context carefully and see if the agent's answer is accurate. 2. Do not mark the agent as successful unless it prints out the context and reads it manually or alternatively uses subagents to answer the question.
 For example, if the agent uses regex or string matching/contains logic to answer the question, this is a heuristic that may not be reliable in general and thus should not be marked as successful.
 Using subagents is okay since subagents can view the context on behalf of the agent.
+{%- endif %}
 Please provide a reason and success flag (boolean value) in the following format:
 ```json
 {
