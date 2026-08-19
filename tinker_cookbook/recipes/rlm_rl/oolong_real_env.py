@@ -1,12 +1,11 @@
 """
-OOLONG-Pairs: pairwise-aggregation over a long context, scored by set F1.
+OOLONG-Real environment for Recursive Agent Optimization.
 """
 
 from __future__ import annotations
 
-import ast
-import functools
 import json
+import random
 import re
 from collections.abc import Sequence
 from typing import Any
@@ -21,105 +20,147 @@ from tinker_cookbook.recipes.rlm_rl.rao import (
     RepeatingRLDataset,
     expand_rao_trajectories,
 )
+from tinker_cookbook.recipes.rlm_rl.rlm.prompts import judge_system_prompt
 from tinker_cookbook.recipes.rlm_rl.rlm.tools import current_renderer
 from tinker_cookbook.recipes.rlm_rl.rlm_harness import RLMHarness
-from tinker_cookbook.renderers import get_renderer
+from tinker_cookbook.renderers import get_renderer, get_text_content
 from tinker_cookbook.rl.message_env import EnvFromMessageEnv
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, RLDataset, RLDatasetBuilder, Trajectory
 
-PAIRS_REPO = "mit-oasys/oolong-pairs"
-SYNTH_REPO = "oolongbench/oolong-synth"
-
-PAIRS_INSTRUCTION = (
-    "The context contains thousands of general-knowledge questions, one per line, each tagged "
-    "with a User ID. Each line implicitly belongs to one of 6 categories: 'numeric value', "
-    "'entity', 'location', 'description and abstract concept', 'abbreviation', 'human being'. "
-    "The labels are not given -- infer them from each question's semantics. Answer the following "
-    "aggregate question about pairs of users."
-)
-
-# Kept byte-for-byte compatible with the length-gen reference implementation
-# (rlm-minimal-training oolong_pairs_fake/env.py) so scores are comparable across setups:
-# parenthesised pairs first, bare `a, b` / `a/b` / `a&b` only as a fallback, <think> blocks
-# stripped before parsing, and self-pairs retained so they count against precision.
-_PAIR_RE = re.compile(r"\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)")
-_BARE_PAIR_RE = re.compile(r"\b(-?\d+)\s*[,/&]\s*(-?\d+)\b")
-_THINK_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
-
-Pair = tuple[int, int]
+REAL_REPO = "oolongbench/oolong-real"
+REAL_CONFIG = "dnd"
+JUDGE_MODEL = "gpt-5-mini"
 
 
-def _parse_pairs(text: str) -> set[Pair]:
-    """Pull pairs out of free text, normalised so the lower ID comes first."""
-    pairs: set[Pair] = set()
-    matches = _PAIR_RE.findall(text or "") or _BARE_PAIR_RE.findall(text or "")
-    for a, b in matches:
-        ia, ib = int(a), int(b)
-        pairs.add((ia, ib) if ia < ib else (ib, ia))
-    return pairs
+def dnd_parse_answer(answer: str) -> int | str | list[str]:
+    try:
+        return int(answer)
+    except ValueError:
+        pass
+    if "," in answer:
+        return [item.strip() for item in answer.split(",") if item.strip()]
+    return answer
 
 
-def pairs_f1(gold: set[Pair], output: str | None) -> float:
-    """Set F1 between the gold pairs and the pairs found in the model's answer."""
-    cleaned = _THINK_RE.sub("", output or "")
-    pred = _parse_pairs(cleaned)
-    if not gold and not pred:
-        return 1.0
-    if not pred or not gold:
-        return 0.0
-    correct = len(pred & gold)
-    if correct == 0:
-        return 0.0
-    precision = correct / len(pred)
-    recall = correct / len(gold)
-    return 2 * precision * recall / (precision + recall)
+def dnd_parse_response(answer: str) -> tuple[int | str | list[str], str]:
+    answer = answer.strip()
+    match = re.search(r"\\boxed\{\\text\{([^}]*)\}\}", answer)
+    if not match:
+        match = re.search(r"\\boxed\{([^}]*)\}", answer)
+    if match:
+        return dnd_parse_answer(match.group(1)), "high"
+    if not answer:
+        return answer, "low"
+    return dnd_parse_answer(answer), "med"
 
 
-@functools.cache
-def load_pairs_context(context_len: int) -> str:
-    """The shared trec_coarse context window for a context length (unlabelled)."""
-    import datasets
+def dnd_score(datapoint: dict[str, Any], output: str | None) -> float:
+    gold = dnd_parse_answer(str(datapoint["answer"]))
+    trimmed_output, _parse_confidence = dnd_parse_response(output or "")
+    if isinstance(gold, int) and isinstance(trimmed_output, int):
+        return float(0.75 ** abs(gold - trimmed_output))
+    if isinstance(gold, str) and isinstance(trimmed_output, str):
+        return float(gold.strip().lower() == trimmed_output.strip().lower())
+    if isinstance(gold, list) and isinstance(trimmed_output, list):
+        overlap = set(gold) & set(trimmed_output)
+        return float(len(overlap) / len(gold)) if gold else 0.0
+    return 0.0
 
-    stream = datasets.load_dataset(SYNTH_REPO, split="validation", streaming=True)
-    for ex in stream:
-        if ex["dataset"] == "trec_coarse" and int(ex["context_len"]) == context_len:
-            return ex["context_window_text"]
-    raise ValueError(f"no trec_coarse context for context_len={context_len}")
+
+def _parse_judge_response(response: str) -> dict[str, Any]:
+    json_match = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL | re.IGNORECASE)
+    if json_match:
+        json_str = json_match.group(1).strip()
+    else:
+        code_match = re.search(r"```\s*(.*?)\s*```", response, re.DOTALL)
+        json_str = code_match.group(1).strip() if code_match else response.strip()
+    parsed = json.loads(json_str)
+    if not isinstance(parsed, dict):
+        raise ValueError("Response must be a JSON object")
+    for field in ("reason", "success"):
+        if field not in parsed:
+            raise ValueError(f"Missing required field: {field}")
+    return parsed
 
 
-def load_pairs(*, context_len: int, num_examples: int, seed: int = 0) -> list[dict[str, Any]]:
-    """Questions + gold pair sets for one context length, paired with their shared context."""
-    from huggingface_hub import hf_hub_download
+def parse_judge_score(response: str) -> float:
+    rubric = _parse_judge_response(response)
+    success_flag = rubric["success"]
+    if isinstance(success_flag, bool):
+        return 1.0 if success_flag else 0.0
+    return 0.0
 
-    path = hf_hub_download(
-        repo_id=PAIRS_REPO,
-        filename=f"data/oolong-pairs-{context_len}.json",
-        repo_type="dataset",
+
+def _action_history(harness: RLMHarness) -> str:
+    parts: list[str] = []
+    for message in harness.messages:
+        if message.get("role") == "system":
+            continue
+        parts.append(f"{message.get('role', '')}: {get_text_content(message)}")
+    return "\n".join(parts)
+
+
+async def judge_subagent(harness: RLMHarness, *, model: str = JUDGE_MODEL) -> float:
+    from openai import AsyncOpenAI
+
+    goal = harness.root_prompt or ""
+    if harness.context:
+        prompt_start = f"# Task:\n{goal}\n\n# Context:\n{harness.context}"
+    else:
+        prompt_start = f"# Task:\n{goal}"
+    final_message = harness.repl.final_answer
+    user_prompt = (
+        f"{prompt_start}\n\n# Agent Trajectory Info\n## Action History\n{_action_history(harness)}"
+        f"\n\n## Agent Output\n{final_message if final_message is not None else 'No output provided'}"
+        "\n\n## Error Message\nNo error message."
     )
-    with open(path) as f:
-        questions = json.load(f)
-    context = load_pairs_context(context_len)
-
-    rows: list[dict[str, Any]] = []
-    for q in questions[:num_examples]:
-        answer = q["answer"]
-        if isinstance(answer, str):
-            answer = ast.literal_eval(answer)
-        gold = _parse_pairs(" ".join(str(p) for p in answer))
-        rows.append(
-            {
-                "id": q["id"],
-                "question": q["question"],
-                "gold": gold,
-                "context_window_text": context,
-            }
+    try:
+        completion = await AsyncOpenAI().chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": judge_system_prompt()},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=1,
         )
+        text = completion.choices[0].message.content or ""
+        return parse_judge_score(text)
+    except Exception:
+        return 0.0
+
+
+def load_real(
+    *,
+    split: str,
+    n_episodes: int,
+    max_chars: int | None = None,
+    num_examples: int | None = None,
+    seed: int = 0,
+) -> list[dict[str, Any]]:
+    from datasets import load_dataset
+
+    dataset = load_dataset(REAL_REPO, REAL_CONFIG, split=split)
+    rows: list[dict[str, Any]] = []
+    for ex in dataset:
+        episodes = ex.get("episodes") or []
+        if len(episodes) != n_episodes:
+            continue
+        text = ex["context_window_text"]
+        if max_chars is not None and len(text) > max_chars:
+            continue
+        rows.append(dict(ex))
+    rng = random.Random(seed)
+    rng.shuffle(rows)
+    if num_examples is not None:
+        rows = rows[:num_examples]
     if not rows:
-        raise ValueError(f"no pairs questions for context_len={context_len}")
+        raise ValueError(
+            f"no oolong-real examples for split={split} n_episodes={n_episodes} max_chars={max_chars}"
+        )
     return rows
 
 
-class PairsEnvGroupBuilder(EnvGroupBuilder):
+class RealEnvGroupBuilder(EnvGroupBuilder):
     def __init__(
         self,
         *,
@@ -130,10 +171,11 @@ class PairsEnvGroupBuilder(EnvGroupBuilder):
         depth: int,
         max_iterations: int,
         max_trajectory_tokens: int,
-        sub_reward_lambda: float = 0.0,
+        sub_reward_lambda: float = 0.4,
         max_sub_calls: int = 50,
-        child_max_iterations: int = 8,
+        child_max_iterations: int = 15,
         sub_completer: MessageCompleter | None = None,
+        judge_model: str = JUDGE_MODEL,
         repl_mem_limit_bytes: int = 2 * 1024**3,
         repl_compute_timeout_s: float = 60.0,
         nudge_hint: bool = True,
@@ -149,6 +191,7 @@ class PairsEnvGroupBuilder(EnvGroupBuilder):
         self.max_sub_calls = max_sub_calls
         self.child_max_iterations = child_max_iterations
         self.sub_completer = sub_completer
+        self.judge_model = judge_model
         self.repl_mem_limit_bytes = repl_mem_limit_bytes
         self.repl_compute_timeout_s = repl_compute_timeout_s
         self.nudge_hint = nudge_hint
@@ -160,15 +203,18 @@ class PairsEnvGroupBuilder(EnvGroupBuilder):
         )
         renderer = get_renderer(renderer_name, tokenizer_utils.get_tokenizer(self.model_name))
         current_renderer.set(renderer)
-        gold: set[Pair] = self.row["gold"]
+        row = self.row
 
         async def grade(final_answer: str | None) -> float:
-            return pairs_f1(gold, final_answer)
+            return dnd_score(row, final_answer)
+
+        async def sub_grade(harness: RLMHarness) -> float:
+            return await judge_subagent(harness, model=self.judge_model)
 
         self._harnesses_G = [
             RLMHarness(
-                context=self.row["context_window_text"],
-                root_prompt=f"{PAIRS_INSTRUCTION}\n\nQuestion: {self.row['question']}",
+                context=row["context_window_text"],
+                root_prompt=row["question"],
                 max_iterations=self.max_iterations,
                 max_depth=self.depth,
                 child_max_iterations=self.child_max_iterations,
@@ -183,7 +229,12 @@ class PairsEnvGroupBuilder(EnvGroupBuilder):
         return [
             EnvFromMessageEnv(
                 renderer=renderer,
-                message_env=HarnessEnv(h, grade, sub_reward_lambda=self.sub_reward_lambda),
+                message_env=HarnessEnv(
+                    h,
+                    grade,
+                    sub_reward_lambda=self.sub_reward_lambda,
+                    sub_grade=sub_grade,
+                ),
                 failed_parse_reward=0.0,
                 context_overflow_reward=0.0,
                 max_trajectory_tokens=self.max_trajectory_tokens,
@@ -197,7 +248,7 @@ class PairsEnvGroupBuilder(EnvGroupBuilder):
         self._harnesses_G = []
 
     def logging_tags(self) -> list[str]:
-        return ["oolong_pairs"]
+        return ["oolong_real"]
 
     async def compute_group_rewards(
         self, trajectory_group: list[Trajectory], env_group: Sequence[Env]
@@ -206,22 +257,21 @@ class PairsEnvGroupBuilder(EnvGroupBuilder):
 
 
 @chz.chz
-class OolongPairsDatasetBuilder(RLDatasetBuilder):
-    """Train on one OOLONG-Pairs context-length bucket, eval on a longer one."""
-
+class OolongRealDatasetBuilder(RLDatasetBuilder):
     model_name_for_tokenizer: str
     batch_size: int
     group_size: int
     renderer_name: str | None = None
-    depth: int = 1
-    sub_reward_lambda: float = 0.0
-    train_context_len: int = 8192
-    eval_context_len: int = 32768
-    num_train_examples: int = 20
-    num_eval_examples: int = 20
+    depth: int = 2
+    sub_reward_lambda: float = 0.4
+    train_n_episodes: int = 1
+    eval_n_episodes: int = 2
+    train_max_chars: int = 240000
+    num_train_examples: int | None = None
+    num_eval_examples: int | None = 20
     n_batches: int = 50
     max_iterations: int = 15
-    child_max_iterations: int = 8
+    child_max_iterations: int = 15
     max_trajectory_tokens: int = 32768
     max_sub_calls: int = 50
     eval_max_iterations: int | None = None
@@ -230,6 +280,7 @@ class OolongPairsDatasetBuilder(RLDatasetBuilder):
     sub_renderer_name: str | None = None
     disable_thinking: bool = True
     sub_temperature: float = 1.0
+    judge_model: str = JUDGE_MODEL
     repl_mem_limit_gb: int = 2
     repl_compute_timeout_s: float = 60.0
     nudge_hint: bool = True
@@ -267,13 +318,13 @@ class OolongPairsDatasetBuilder(RLDatasetBuilder):
         sub_completer: MessageCompleter | None,
         *,
         is_eval: bool = False,
-    ) -> PairsEnvGroupBuilder:
+    ) -> RealEnvGroupBuilder:
         max_iterations = self.max_iterations
         max_sub_calls = self.max_sub_calls
         if is_eval:
             max_iterations = self.eval_max_iterations or max_iterations
             max_sub_calls = self.eval_max_sub_calls or max_sub_calls
-        return PairsEnvGroupBuilder(
+        return RealEnvGroupBuilder(
             row=row,
             model_name=self.model_name_for_tokenizer,
             renderer_name=self.policy_renderer_name(),
@@ -285,6 +336,7 @@ class OolongPairsDatasetBuilder(RLDatasetBuilder):
             max_sub_calls=max_sub_calls,
             child_max_iterations=self.child_max_iterations,
             sub_completer=sub_completer,
+            judge_model=self.judge_model,
             repl_mem_limit_bytes=self.repl_mem_limit_gb * 1024**3,
             repl_compute_timeout_s=self.repl_compute_timeout_s,
             nudge_hint=self.nudge_hint,
@@ -292,8 +344,10 @@ class OolongPairsDatasetBuilder(RLDatasetBuilder):
 
     async def __call__(self) -> tuple[RLDataset, RLDataset | None]:
         sub_completer = self._sub_completer()
-        train_rows = load_pairs(
-            context_len=self.train_context_len,
+        train_rows = load_real(
+            split="validation",
+            n_episodes=self.train_n_episodes,
+            max_chars=self.train_max_chars,
             num_examples=self.num_train_examples,
             seed=self.seed,
         )
@@ -303,10 +357,11 @@ class OolongPairsDatasetBuilder(RLDatasetBuilder):
             n_batches=self.n_batches,
             seed=self.seed,
         )
-        if self.num_eval_examples <= 0:
+        if not self.num_eval_examples:
             return train, None
-        eval_rows = load_pairs(
-            context_len=self.eval_context_len,
+        eval_rows = load_real(
+            split="test",
+            n_episodes=self.eval_n_episodes,
             num_examples=self.num_eval_examples,
             seed=self.seed,
         )

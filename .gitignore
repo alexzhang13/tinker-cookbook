@@ -11,3 +11,6 @@ eval_qwen35_35b.md
 run_eval_qwen35.py
 **/__marimo__
 experiments/
+
+# Local experiment logs (not part of the published recipe)
+EXP_*.md

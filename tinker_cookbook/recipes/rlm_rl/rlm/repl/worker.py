@@ -1,8 +1,9 @@
 """Bounded REPL worker: length-prefixed pickle frames over stdin/stdout.
 
 Launched as a script path, never imported: the child needs a clean address space to put an
-RLIMIT_AS on, and importing ``tinker_cookbook`` would pull torch into every REPL. Stdlib only.
-Sub-LLM bindings appear as ordinary sync functions that RPC back to the driver and block.
+RLIMIT_AS on, and importing ``tinker_cookbook`` would pull torch into every REPL. Stdlib
+plus the sibling ``_protocol.py`` only (both stdlib underneath). Sub-LLM bindings appear as
+ordinary sync functions that RPC back to the driver and block.
 """
 
 from __future__ import annotations
@@ -10,12 +11,12 @@ from __future__ import annotations
 import contextlib
 import io
 import os
-import pickle
 import resource
-import struct
 import sys
 import traceback
-from typing import Any, BinaryIO
+from typing import Any
+
+import _protocol
 
 OUTPUT_LIMIT_CHARS = 262_144
 
@@ -55,54 +56,10 @@ class _BoundedWriter(io.TextIOBase):
         return text
 
 
-FRAME_MAGIC = b"RPL1"
-
-
-def _write_all(out: BinaryIO, data: bytes) -> None:
-    view = memoryview(data)
-    while view:
-        written = out.write(view)
-        if not written:
-            raise BrokenPipeError("driver stopped accepting input")
-        view = view[written:]
-
-
-def _send(out: BinaryIO, obj: Any) -> None:
-    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    _write_all(out, FRAME_MAGIC + struct.pack(">I", len(payload)) + payload)
-    out.flush()
-
-
-def _read_exactly(inp: BinaryIO, n: int) -> bytes | None:
-    """Read exactly n bytes, or None if the pipe closes first (a short read is not EOF)."""
-    chunks: list[bytes] = []
-    remaining = n
-    while remaining > 0:
-        chunk = inp.read(remaining)
-        if not chunk:
-            return None
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
-
-
-def _recv(inp: BinaryIO) -> Any:
-    header = _read_exactly(inp, len(FRAME_MAGIC) + 4)
-    if header is None:
-        return None
-    if header[: len(FRAME_MAGIC)] != FRAME_MAGIC:
-        raise RuntimeError(f"desynchronised frame (magic={header[: len(FRAME_MAGIC)]!r})")
-    (n,) = struct.unpack(">I", header[len(FRAME_MAGIC) :])
-    buf = _read_exactly(inp, n)
-    if buf is None:
-        return None
-    return pickle.loads(buf)
-
-
-def _make_stub(inp: BinaryIO, out: BinaryIO, name: str):
+def _make_stub(inp: Any, out: Any, name: str):
     def stub(*args: Any, **kwargs: Any) -> Any:
-        _send(out, ("call", name, args, kwargs))
-        resp = _recv(inp)
+        _protocol.send(out, ("call", name, args, kwargs))
+        resp = _protocol.recv(inp)
         if resp is None or resp[0] != "call_result":
             raise RuntimeError(f"{name}: lost connection to the driver")
         ok, value = resp[1], resp[2]
@@ -144,7 +101,7 @@ def main() -> int:
 
     _die_with_parent()
 
-    init = _recv(proto_in)
+    init = _protocol.recv(proto_in)
     if init is None or init[0] != "init":
         return 1
     _, variables, binding_names, mem_limit_bytes = init
@@ -159,10 +116,10 @@ def main() -> int:
     for name in binding_names:
         ns[name] = _make_stub(proto_in, proto_out, name)
 
-    _send(proto_out, ("ready",))
+    _protocol.send(proto_out, ("ready",))
 
     while True:
-        msg = _recv(proto_in)
+        msg = _protocol.recv(proto_in)
         if msg is None or msg[0] == "shutdown":
             return 0
         if msg[0] != "exec":
@@ -183,7 +140,7 @@ def main() -> int:
         except BaseException:
             payload = ("exec_done", "", "REPL output too large to return", None)
         try:
-            _send(proto_out, payload)
+            _protocol.send(proto_out, payload)
         except BaseException:
             return 1
 

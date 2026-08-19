@@ -12,11 +12,8 @@ _PROMPTS_DIR = Path(__file__).parent.parent / "prompts"
 
 @functools.cache
 def nudge_hint_text(max_sub_calls: int = 25) -> str:
-    """The "nudge to decompose" block appended to the system prompt.
-
-    Tells the model to act as an orchestrator: plan a decomposition, push long-context work into
-    sub-LLM calls, and keep batches small with dense prompts. Turning it off leaves the neutral
-    prompt, which describes the REPL interface and says nothing about strategy.
+    """The "nudge to decompose" addendum from: 
+    https://www.alphaxiv.org/abs/2607.language-model-harnesses
     """
     template = jinja2.Template((_PROMPTS_DIR / "nudge_hint.jinja").read_text())
     return template.render(max_sub_calls=max_sub_calls).strip()
@@ -56,6 +53,12 @@ def system_messages(
         {"role": "system", "content": system},
         {"role": "user", "content": metadata},
     ]
+
+
+@functools.cache
+def judge_system_prompt() -> str:
+    template = jinja2.Template((_PROMPTS_DIR / "judge_system_prompt.jinja").read_text())
+    return template.render().strip()
 
 
 def turn_prompt(iteration: int, max_iterations: int) -> Message:

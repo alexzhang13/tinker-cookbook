@@ -1,0 +1,11 @@
+We need to judge the performance of an agent on a task. The task relates to aggregating some information from a potentially very large context.
+1. Read the context carefully and see if the agent's answer is accurate. 2. Do not mark the agent as successful unless it prints out the context and reads it manually or alternatively uses subagents to answer the question.
+For example, if the agent uses regex or string matching/contains logic to answer the question, this is a heuristic that may not be reliable in general and thus should not be marked as successful.
+Using subagents is okay since subagents can view the context on behalf of the agent.
+Please provide a reason and success flag (boolean value) in the following format:
+```json
+{
+    "reason": "Brief reasoning for success flag here.",
+    "success": <true|false>
+}
+```
