@@ -24,12 +24,12 @@ class CLIConfig:
     load_checkpoint_path: str | None = None
 
     # Training parameters
-    learning_rate: float = 5e-5
-    group_size: int = 4
-    groups_per_batch: int = 8
+    learning_rate: float | None = None
+    group_size: int | None = None
+    groups_per_batch: int | None = None
     max_steps: int = 50
     max_tokens: int = 4096
-    loss_fn: LossFnType = "importance_sampling"
+    loss_fn: LossFnType | None = None
     loss_fn_config: dict[str, Any] | None = None
     max_steps_off_policy: int | None = None
 
@@ -41,7 +41,7 @@ class CLIConfig:
 
     # Checkpointing and evaluation
     save_every: int = 5
-    eval_every: int = 10
+    eval_every: int | None = None
     num_eval_examples: int = 20
 
     # Dataset-specific parameters
@@ -49,23 +49,25 @@ class CLIConfig:
     renderer_name: str | None = None
     train_context_len: int = 8192
     eval_context_len: int = 32768
-    num_train_examples: int = 20
+    num_train_examples: int | None = None
     seed: int = 42
     judge_model: str = JUDGE_MODEL
+
+    # Fields above and below whose default depends on the dataset are None here and
+    # resolved by `_pick`. They cannot use a plain default: the two recipes disagree, and
+    # comparing against one recipe's default would read an explicit value as "unset".
 
     # RLM-specific parameters
     sub_renderer_name: str | None = None
     disable_thinking: bool = True
-    depth: int = 1
-    # None means "this dataset's default" (0.0 for pairs, 0.4 for real). Explicit so that
-    # sub_reward_lambda=0.0 stays 0.0 on the real dataset instead of being read as unset.
+    depth: int | None = None
     sub_reward_lambda: float | None = None
     max_iterations: int = 15
-    child_max_iterations: int = 8
+    child_max_iterations: int | None = None
     max_trajectory_tokens: int = 32768
-    max_sub_calls: int = 200
-    eval_max_iterations: int = 25
-    eval_max_sub_calls: int = 400
+    max_sub_calls: int | None = None
+    eval_max_iterations: int | None = None
+    eval_max_sub_calls: int | None = None
     sub_max_tokens: int = 8192
     sub_temperature: float = 1.0
     repl_mem_limit_gb: int = 2
@@ -79,34 +81,40 @@ class CLIConfig:
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
 
 
-def _real_or_cli(current: Any, pairs_default: Any, real_value: Any) -> Any:
-    return real_value if current == pairs_default else current
+def _pick(value: Any, pairs_default: Any, real_default: Any, *, is_real: bool) -> Any:
+    """An explicit CLI value always wins; None takes this dataset's default."""
+    if value is not None:
+        return value
+    return real_default if is_real else pairs_default
 
 
 async def cli_main(cli_config: CLIConfig):
     install_rao_training()
-    if cli_config.dataset == "real":
-        learning_rate = _real_or_cli(cli_config.learning_rate, 5e-5, 3e-5)
-        group_size = _real_or_cli(cli_config.group_size, 4, 8)
-        groups_per_batch = _real_or_cli(cli_config.groups_per_batch, 8, 16)
-        depth = _real_or_cli(cli_config.depth, 1, 2)
-        sub_reward_lambda = (
-            0.4 if cli_config.sub_reward_lambda is None else (cli_config.sub_reward_lambda)
-        )
-        eval_every = _real_or_cli(cli_config.eval_every, 10, 50)
-        max_sub_calls = _real_or_cli(cli_config.max_sub_calls, 200, 50)
-        eval_max_iterations = _real_or_cli(cli_config.eval_max_iterations, 25, 15)
-        eval_max_sub_calls = _real_or_cli(cli_config.eval_max_sub_calls, 400, 50)
-        child_max_iterations = _real_or_cli(cli_config.child_max_iterations, 8, 15)
-        loss_fn: LossFnType = _real_or_cli(cli_config.loss_fn, "importance_sampling", "cispo")
-        loss_fn_config = cli_config.loss_fn_config
-        if loss_fn == "cispo" and loss_fn_config is None:
-            loss_fn_config = {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0}
+    is_real = cli_config.dataset == "real"
+
+    def pick(value: Any, pairs_default: Any, real_default: Any) -> Any:
+        return _pick(value, pairs_default, real_default, is_real=is_real)
+
+    # Resolved for both recipes, so an explicit CLI value means the same thing either way.
+    learning_rate = pick(cli_config.learning_rate, 5e-5, 3e-5)
+    group_size = pick(cli_config.group_size, 4, 8)
+    groups_per_batch = pick(cli_config.groups_per_batch, 8, 16)
+    depth = pick(cli_config.depth, 1, 2)
+    sub_reward_lambda = pick(cli_config.sub_reward_lambda, 0.0, 0.4)
+    eval_every = pick(cli_config.eval_every, 10, 50)
+    max_sub_calls = pick(cli_config.max_sub_calls, 200, 50)
+    eval_max_iterations = pick(cli_config.eval_max_iterations, 25, 15)
+    eval_max_sub_calls = pick(cli_config.eval_max_sub_calls, 400, 50)
+    child_max_iterations = pick(cli_config.child_max_iterations, 8, 15)
+    num_train_examples = pick(cli_config.num_train_examples, 20, None)
+    loss_fn: LossFnType = pick(cli_config.loss_fn, "importance_sampling", "cispo")
+    loss_fn_config = cli_config.loss_fn_config
+    if loss_fn == "cispo" and loss_fn_config is None:
+        loss_fn_config = {"clip_low_threshold": 0.0, "clip_high_threshold": 5.0}
+
+    if is_real:
         max_steps_off_policy = (
             3 if cli_config.max_steps_off_policy is None else cli_config.max_steps_off_policy
-        )
-        num_train_examples = (
-            None if cli_config.num_train_examples == 20 else cli_config.num_train_examples
         )
         dataset_builder = OolongRealDatasetBuilder(
             model_name_for_tokenizer=cli_config.model_name,
@@ -142,35 +150,31 @@ async def cli_main(cli_config: CLIConfig):
             groups_per_batch=groups_per_batch,
         )
     else:
-        learning_rate = cli_config.learning_rate
-        eval_every = cli_config.eval_every
-        loss_fn = cli_config.loss_fn
-        loss_fn_config = cli_config.loss_fn_config
         dataset_builder = OolongPairsDatasetBuilder(
             model_name_for_tokenizer=cli_config.model_name,
             renderer_name=cli_config.renderer_name,
             sub_renderer_name=cli_config.sub_renderer_name,
             disable_thinking=cli_config.disable_thinking,
-            batch_size=cli_config.groups_per_batch,
-            group_size=cli_config.group_size,
-            depth=cli_config.depth,
-            sub_reward_lambda=cli_config.sub_reward_lambda or 0.0,
+            batch_size=groups_per_batch,
+            group_size=group_size,
+            depth=depth,
+            sub_reward_lambda=sub_reward_lambda,
             train_context_len=cli_config.train_context_len,
             eval_context_len=cli_config.eval_context_len,
-            num_train_examples=cli_config.num_train_examples,
+            num_train_examples=num_train_examples,
             n_batches=cli_config.max_steps,
             max_iterations=cli_config.max_iterations,
-            child_max_iterations=cli_config.child_max_iterations,
+            child_max_iterations=child_max_iterations,
             max_trajectory_tokens=cli_config.max_trajectory_tokens,
-            max_sub_calls=cli_config.max_sub_calls,
-            eval_max_iterations=cli_config.eval_max_iterations,
-            eval_max_sub_calls=cli_config.eval_max_sub_calls,
+            max_sub_calls=max_sub_calls,
+            eval_max_iterations=eval_max_iterations,
+            eval_max_sub_calls=eval_max_sub_calls,
             sub_max_tokens=cli_config.sub_max_tokens,
             sub_temperature=cli_config.sub_temperature,
             repl_mem_limit_gb=cli_config.repl_mem_limit_gb,
             repl_compute_timeout_s=cli_config.repl_compute_timeout_s,
             nudge_hint=cli_config.nudge_hint,
-            num_eval_examples=cli_config.num_eval_examples if cli_config.eval_every > 0 else 0,
+            num_eval_examples=cli_config.num_eval_examples if eval_every > 0 else 0,
             seed=cli_config.seed,
         )
         renderer_name = dataset_builder.policy_renderer_name()
@@ -184,7 +188,7 @@ async def cli_main(cli_config: CLIConfig):
         if cli_config.max_steps_off_policy is not None:
             async_config = AsyncConfig(
                 max_steps_off_policy=cli_config.max_steps_off_policy,
-                groups_per_batch=cli_config.groups_per_batch,
+                groups_per_batch=groups_per_batch,
             )
 
     if cli_config.log_path is not None:

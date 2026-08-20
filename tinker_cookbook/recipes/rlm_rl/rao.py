@@ -1,37 +1,5 @@
-r"""Recursive Agent Optimization (RAO) over a harness of recursive sub-agents.
-
-A rollout is a *tree*: a root agent solves the task and may spawn sub-agents, which may
-spawn their own. RAO trains one shared policy on every node of that tree, so a single
-rollout yields one trajectory per node rather than one per rollout.
-
-Three equations from the paper ([RAO](https://arxiv.org/abs/2605.06639)) are implemented
-here, one per public function:
-
-    node reward   (Eq. 1)  R(X, \tau_X) = \tilde{s}(X, \tau_X)
-                                          + \lambda \frac{1}{|C(X)|}
-                                            \sum_{c \in C(X)} \tilde{s}(c, \tau_c)
-
-    advantage     (Eq. 3)  A(\tau^{(g)}) = R(\tau^{(g)}) - b_{-g},
-                           b_{-g} = \frac{1}{G-1} \sum_{g' \neq g} R^{(g')}_{root}
-
-    depth weight  (Eq. 4)  w_d = \alpha / N_d,
-                           \alpha = \sum_d N_d / D
-
-where `\tilde{s} \in [0, 1]` is the success signal for one node (task metric for the root,
-LLM judge for a sub-agent), `C(X)` are a node's immediate children, `G` is the group size,
-`N_d` is the number of trained depth-`d` trajectories in the group, and `D` is the number
-of distinct depths present. Note Eq. 3 subtracts a *root*-only leave-one-out baseline from
-every node at every depth: the paper's deliberate choice, putting all nodes under one root
-task on a common reference scale without needing a critic or per-sub-task comparison
-groups. Eq. 4 then keeps deep, numerous nodes from swamping the few root trajectories,
-while `\alpha` preserves the total update scale.
-
-Reading order, top to bottom:
-
-    RAOHarnessEnv           rolls out one tree and scores its nodes (Eq. 1)
-    expand_rao_trajectories  flattens a group's trees into trainable trajectories
-    rao_advantages           weights and centers those trajectories (Eqs. 3 and 4)
-    install_rao_training     wires both into the cookbook RL loop
+"""
+Recursive Agent Optimization (RAO) over a harness of recursive sub-agents (RLMs).
 """
 
 from __future__ import annotations
@@ -76,7 +44,7 @@ class RAOHarnessEnv(MessageEnv):
     `step` scores every node in the tree with Eq. 1 and hands the sub-agents' trajectories
     to `expand_rao_trajectories` via `extra_trajectories`.
 
-    Discarded trees: `step` only runs while the rollout runner is still stepping this env.
+    On discarded trees: `step` only runs while the rollout runner is still stepping this env.
     If the runner ends the rollout itself -- the sampler hit `max_tokens`, the response
     failed to parse, or the conversation outgrew the context window -- it never calls
     `step`, so the tree is never graded and *the whole tree is thrown out*: sub-agent turns
@@ -151,14 +119,14 @@ class RAOHarnessEnv(MessageEnv):
         its own trajectory, which is where `rao_advantages` reads it.
         """
         assert isinstance(self.harness, RLMHarness)
-        nodes = _walk_tree(self.harness)
+        tree = _walk_tree(self.harness)
+        nodes = [node for node, _children in tree]
         successes = [root_success, *await self._grade_sub_agents(nodes[1:])]
         success_of = dict(zip(nodes, successes, strict=True))
 
         root_reward = root_success
         sub_agent_trajectories: list[Trajectory] = []
-        for node in nodes:
-            children = node.children
+        for node, children in tree:
             bonus = sum(success_of[c] for c in children) / len(children) if children else 0.0
             reward = success_of[node] + self.sub_reward_lambda * bonus
             if node is self.harness:
@@ -359,12 +327,21 @@ class _NodeInfo:
         )
 
 
-def _walk_tree(root: RLMHarness) -> list[RLMHarness]:
-    """The tree flattened depth-first, root first."""
-    nodes = [root]
-    for child in root.children:
-        nodes.extend(_walk_tree(child))
-    return nodes
+def _walk_tree(root: RLMHarness) -> list[tuple[RLMHarness, list[RLMHarness]]]:
+    """The tree flattened depth-first, root first, each node paired with the children it
+    had at this instant.
+
+    The pairing is the point: the tree can still be growing. A sub-call orphaned by a
+    failed `*_batched` gather (one raises, its siblings are never cancelled) keeps running
+    and appends itself to its parent's children when it finishes -- possibly while grading
+    is awaiting judge verdicts. Scoring against a snapshot keeps every child that a node is
+    credited for inside the set of nodes that were graded. Latecomers are left untrained,
+    like any other node whose tree was not graded.
+    """
+    tree = [(root, list(root.children))]
+    for child in tree[0][1]:
+        tree.extend(_walk_tree(child))
+    return tree
 
 
 def _rao_env(env: Env) -> RAOHarnessEnv | None:

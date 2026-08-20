@@ -226,6 +226,12 @@ async def judge_subagent(harness: RLMHarness, *, model: str = JUDGE_MODEL) -> fl
         f"{prompt_start}\n\n# Agent Trajectory Info\n## Action History\n{_action_history(harness)}"
         f"\n\n## Agent Output\n{final_message if final_message is not None else 'No output provided'}"
         "\n\n## Error Message\nNo error message."
+        # Restated after the trajectory: with tens of thousands of tokens between the system
+        # rubric and here, the judge otherwise drifts into answering the agent's task itself
+        # (measured at 25-50% of verdicts once the prompt passes ~30K tokens).
+        "\n\n# Your verdict\nYou are grading the agent above, not solving its task. Do not "
+        "answer the task yourself. Reply with only the JSON object described in your "
+        "instructions, with the `reason` and `success` fields."
     )
     messages: list[Message] = [
         {"role": "system", "content": judge_system_prompt(no_repl=harness.no_repl)},

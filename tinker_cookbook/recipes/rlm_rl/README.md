@@ -11,7 +11,7 @@ uv pip install 'tinker-cookbook[rlm-rl] @ git+https://github.com/thinking-machin
 ```
 
 ## RL on short tasks, generalizing to long tasks
-This recipe first replicates an experiment in the [Language model harnesses are compositional generalizers](https://alexzhang13.github.io/blog/2026/harness/) blogpost, which trains a local Qwen model as an RLM on only short tasks to see generalization on longer variants. We train only the root model, which can be thought of as applying RAO with $\lambda=0$.
+This first recipe is similar to an experiment in the [Language model harnesses are compositional generalizers](https://alexzhang13.github.io/blog/2026/harness/) blogpost, which trains a local Qwen model as an RLM on only short tasks to see generalization on longer variants. We train only the root model, which can be thought of as applying RAO with $\lambda=0$.
 
 This recipe trains a Recursive Language Model (RLM) with RL on sequences of input length 8K on [`Oolong-Pairs`](https://huggingface.co/datasets/mit-oasys/oolong-pairs) and evaluates on input sequences of length 32K. The output size grows combinatorially with length because the tasks asks for pairs of inputs satisfying some property, meaning the harness has to generalize to an order of magnitude larger output length.
 
@@ -48,43 +48,19 @@ We use Qwen3.5-9B without thinking. You should find that it trains for roughly 1
 | step 50 | **0.549** | **17.1** | 10.6 |
 
 
-## RL on OOLONG-REAL (RAO)
+## RL on higher recursion depths
+The second recipe trains an RLM with Recursive Agent Optimization ($\lambda > 0$), training the root and the sub-agents at recursion depth 2. We train on a split of (~55k) OOLONG-Real, and evaluate on
+held-out(~118k) test examples. Sub-agents are trained on-policy with RAO ($\lambda=0.4$, depth 2).
 
-Train the same RLM frontend on 1-episode (~55k) OOLONG-REAL validation examples and evaluate on
-held-out 2-episode (~118k) test examples. Sub-agents are trained on-policy with RAO
-($\lambda=0.4$, depth 2).
-
-Every sub-call is a node in the RAO tree: `rlm_query` / `launch_subagent` spawn a sub-agent with
-its own REPL, and an `llm_query` is treated as a sub-agent that has hit the depth limit — a
-single-turn agent with no REPL. All of them are sampled from the training policy, graded, and
-credited to their parent through the delegation bonus. At $\lambda=0$ sub-calls instead go to a
-separate frozen sampling client and only the root is trained.
-
-Because sub-agent success has no verifier, $\lambda>0$ scores each sub-agent with an LLM judge.
-The default judge is `thinkingmachines/Inkling-Small`, served by Tinker, so grading needs no
-second provider or API key. It is sampled at an explicit thinking effort (`JUDGE_EFFORT`, default
-0.7) because Inkling is post-trained with an effort message; at 0.2 it applies the rubric
-noticeably less consistently. The paper's judge is one flag away, and needs `OPENAI_API_KEY` set
-(the run fails at startup if it is not):
-
-```bash
-    judge_model=gpt-5-mini
-```
-
-The judge sees one of two rubrics. A sub-agent with a REPL gets the paper's rubric, which only
-passes an agent that read the context or delegated. A single-turn `llm_query` sub-agent can do
-neither, so it gets a variant that grades its answer alone — under the REPL rubric an
-Inkling-Small judge failed correct single-turn answers 4 times in 6, explicitly citing the missing
-process. Either way it is one judge call per node, so judge calls per step scale with
-`max_sub_calls`.
+Following the RAO setup, $\lambda>0$ scores each sub-agent with an LLM judge on OOLONG-Real. We `thinkingmachines/Inkling-Small` as the judge.
 
 ```bash
 python -m tinker_cookbook.recipes.rlm_rl.train \
     dataset=real \
     model_name="Qwen/Qwen3.5-9B" \
     log_path=/tmp/tinker-examples/rlm_rl/real-55k-to-118k \
-    group_size=8 \
-    groups_per_batch=16 \
+    group_size=4 \
+    groups_per_batch=4 \
     learning_rate=3e-5 \
     lora_rank=32 \
     depth=2 \
