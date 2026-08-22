@@ -16,6 +16,7 @@ import torch
 
 from tinker_cookbook.completers import TinkerTokenCompleter
 from tinker_cookbook.recipes.rlm_rl.harness.base import Harness, Prompt
+from tinker_cookbook.recipes.rlm_rl.harness.repl import REPLHarness
 from tinker_cookbook.recipes.rlm_rl.rlm.tools import current_token_completer
 from tinker_cookbook.recipes.rlm_rl.rlm_harness import RLMHarness
 from tinker_cookbook.renderers.base import Message
@@ -106,6 +107,17 @@ class RAOHarnessEnv(MessageEnv):
             logs={"final_answer": turn.final_answer or "<no answer submitted>"},
         )
 
+    async def observe_truncated_response(self, message: Message) -> list[Message] | None:
+        """Keep a turn the sampler cut off at `max_tokens` so the tree survives it.
+
+        Paired with `terminate_on_length=False` on the adapter. Without both, one over-long
+        turn discards the whole tree, and the loss is not evenly spread: a policy that
+        delegates more writes longer code blocks, so the discard rate climbs with training
+        and quietly censors the metrics (it reached 43% of rollouts in one 42-step run)."""
+        if not isinstance(self.harness, REPLHarness):
+            return None
+        return self.harness.observe_truncated(message)
+
     def _grades_sub_agents(self) -> bool:
         return self.sub_reward_lambda != 0.0 and isinstance(self.harness, RLMHarness)
 
@@ -176,7 +188,15 @@ def expand_rao_trajectories(
     sub_agent_trajectories: list[Trajectory] = []
     for tree_idx, (traj, env) in enumerate(zip(trajectory_group, env_group, strict=True)):
         rao_env = _rao_env(env)
-        if rao_env is None or rao_env.sub_reward_lambda == 0.0:
+        if rao_env is None:
+            continue
+        if traj.transitions and "correct" not in traj.transitions[-1].metrics:
+            # The runner ended this rollout before the harness could be graded, so `step`
+            # never emitted `correct`. Scoring it 0 keeps the denominator fixed: a rollout
+            # that never answered is a failure, not an absence. It still has no IS_ROOT, so
+            # it stays out of the Eq. 3 baseline and earns no gradient.
+            traj.transitions[-1].metrics |= {"correct": 0.0, "answered": 0.0, "discarded": 1.0}
+        if rao_env.sub_reward_lambda == 0.0:
             continue
         for node_traj in [traj, *rao_env.extra_trajectories]:
             if node_traj.transitions:

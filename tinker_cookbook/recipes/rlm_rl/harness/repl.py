@@ -35,6 +35,7 @@ class REPLHarness(Harness):
         self.compute_timeout_s = compute_timeout_s
         self.messages: list[Message] = []
         self.repl_calls = 0
+        self.truncated_turns = 0
         self._iteration = 0
         self.repl = PythonRepl(
             variables=dict(variables or {}),
@@ -53,6 +54,7 @@ class REPLHarness(Harness):
         return {
             "turns": float(self._iteration),
             "repl_calls": float(self.repl_calls),
+            "truncated_turns": float(self.truncated_turns),
         }
 
     async def start(self) -> Turn:
@@ -65,6 +67,28 @@ class REPLHarness(Harness):
         self._iteration += 1
         await self._maybe_run_repl(assistant_message)
         return self._next_turn()
+
+    def observe_truncated(self, assistant_message: Message) -> list[Message]:
+        """Keep a turn the sampler cut off at `max_tokens`, and let the session continue.
+
+        A clipped ```repl block is not valid Python, so nothing is executed. The turn still
+        costs an iteration, so a session that keeps overrunning terminates on its own budget
+        rather than looping, and the model is told what happened so it can write less."""
+        self.messages.append(assistant_message)
+        self._iteration += 1
+        self.truncated_turns += 1
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Your previous turn hit the response length limit before it finished, so "
+                    "none of its code ran and that turn was spent. Write a shorter block this "
+                    "turn: do one step at a time, and build long strings in code rather than "
+                    "typing them out."
+                ),
+            }
+        )
+        return self.messages
 
     def close(self) -> None:
         self.repl.close()

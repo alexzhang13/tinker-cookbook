@@ -367,6 +367,8 @@ class RealEnvGroupBuilder(EnvGroupBuilder):
                 failed_parse_reward=0.0,
                 context_overflow_reward=0.0,
                 max_trajectory_tokens=self.max_trajectory_tokens,
+                # Keep a turn the sampler clipped rather than discarding the whole tree.
+                terminate_on_length=False,
             )
             for h in self._harnesses_G
         ]

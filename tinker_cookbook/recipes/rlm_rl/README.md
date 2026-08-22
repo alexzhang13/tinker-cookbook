@@ -38,9 +38,7 @@ python -m tinker_cookbook.recipes.rlm_rl.train \
     eval_max_sub_calls=400
 ```
 
-### Expected results
-
-We use Qwen3.5-9B without thinking. You should find that it trains for roughly 12 hours total, with the number of sub-calls decreasing over time as the model learns to be more efficient, and F1 scores on both the training length of 8k and the eval length of 32k gradually rising over time.
+We use Qwen3.5-9B without thinking. You should find that it trains for roughly ~12 hours total, with the number of sub-calls decreasing over time as the model learns to be more efficient, and F1 scores on both the training length of 8k and the eval length of 32k gradually rising over time. On OOLONG-Pairs (32K), you should expect the following length-generalized eval results:
 
 | Checkpoint | 32k F1 | sub-calls | turns |
 |------------|--------|-----------|-------|
@@ -59,8 +57,8 @@ python -m tinker_cookbook.recipes.rlm_rl.train \
     dataset=real \
     model_name="Qwen/Qwen3.5-9B" \
     log_path=/tmp/tinker-examples/rlm_rl/real-55k-to-118k \
-    group_size=4 \
-    groups_per_batch=4 \
+    group_size=8 \
+    groups_per_batch=16 \
     learning_rate=3e-5 \
     lora_rank=32 \
     depth=2 \
@@ -68,10 +66,17 @@ python -m tinker_cookbook.recipes.rlm_rl.train \
     max_iterations=15 \
     child_max_iterations=15 \
     max_sub_calls=50 \
-    eval_every=50 \
+    eval_every=10 \
     num_eval_examples=20 \
-    max_steps=50
+    max_steps=40
 ```
+
+We use Qwen3.5-9B without thinking. You can train this recipe for longer and with a higher group / batch size for better results, but we keep it low because training many sub-agents over iterations can be costly.
+
+| Checkpoint | correct@55k | correct@118k | sub-calls | turns |
+|------------|-------------|--------------|-----------|-------|
+| step 0 (untrained) | 0.272 | 0.209 | 20.9 | 9.2 |
+| step 40 | 0.303 | **0.259** | 37.8 | 8.3 |
 
 [1] Zhang, A. L., Kraska, T., & Khattab, O. (2026). Recursive language models. arXiv preprint arXiv:2512.24601.
 

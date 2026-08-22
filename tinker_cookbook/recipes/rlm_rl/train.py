@@ -28,7 +28,7 @@ class CLIConfig:
     group_size: int | None = None
     groups_per_batch: int | None = None
     max_steps: int = 50
-    max_tokens: int = 4096
+    max_tokens: int = 8192
     loss_fn: LossFnType | None = None
     loss_fn_config: dict[str, Any] | None = None
     max_steps_off_policy: int | None = None
