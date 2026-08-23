@@ -2,7 +2,7 @@
 
 Harnesses with LLM sub-agents, where a root LLM spawns sub-LLMs, are increasingly being used for most tasks. [Recursive Language Models (RLM)](https://arxiv.org/abs/2512.24601) [1] are one popular example, which use a persistent REPL with recursive sub-agents are functions, and the context as a variable in the REPL. [Recursive Agent Optimization (RAO)](https://arxiv.org/abs/2605.06639) [2] is an RL training strategy around how to reward each LLM for recursive agent strategies like the RLM.
 
-This recipe focuses on two examples of recursive agent training, one where we only assign rewards to the root model (i.e. RAO with $\lambda=0$), and one where we assign partial rewards to sub-agents as well during RL training.
+This recipe focuses on two examples of recursive agent training, one where we only assign rewards to the root model (i.e. RAO with $\lambda=0$), and one where we assign partial rewards to recursive sub-agents (depth=2) as well during RL training. Note that harness training is generally more expensive due to much longer, iterative steps, as well as (potentially recursive) additional sub-agent rollouts in a single trajectory.
 
 ## Installation
 
@@ -47,8 +47,7 @@ We use Qwen3.5-9B without thinking. You should find that it trains for roughly ~
 
 
 ## RL on higher recursion depths
-The second recipe trains an RLM with Recursive Agent Optimization ($\lambda > 0$), training the root and the sub-agents at recursion depth 2. We train on a split of (~55k) OOLONG-Real, and evaluate on
-held-out(~118k) test examples. Sub-agents are trained on-policy with RAO ($\lambda=0.4$, depth 2).
+The second recipe trains an RLM with Recursive Agent Optimization ($\lambda > 0$), training the root and the sub-agents at recursion depth 2. We train on a split of (~55k) OOLONG-Real, and evaluate on held-out(~118k) test examples. Sub-agents are trained on-policy with RAO ($\lambda=0.4$, depth 2).
 
 Following the RAO setup, $\lambda>0$ scores each sub-agent with an LLM judge on OOLONG-Real. We `thinkingmachines/Inkling-Small` as the judge.
 
